@@ -1,0 +1,20 @@
+# Compiled binaries
+tests/basic
+tests/features
+tests/file_line
+tests/game_math
+tests/minimal_rewind
+tests/missing
+tests/more
+tests/numeric
+tests/reflection
+tests/vfs
+tests/visibility
+examples/run_file
+
+# Object files
+*.o
+*.obj
+
+# macOS
+.DS_Store
