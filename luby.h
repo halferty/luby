@@ -443,6 +443,9 @@ typedef struct luby_vm_frame {
     int *param_existed;
     luby_value *param_saved;
     size_t param_count;
+    int *local_existed;
+    luby_value *local_saved;
+    size_t local_count;
 } luby_vm_frame;
 
 typedef struct luby_vm {
@@ -682,6 +685,8 @@ struct luby_proc {
     int splat_index;              // index of *args param, or -1 if none
     int has_block_param;          // whether &block param exists
     char *block_param_name;       // name of block param (e.g. "block")
+    char **local_names;           // names of local variables (assigned in body, excluding params)
+    size_t local_count;           // number of local variable names
     luby_chunk chunk;
     int owned_by_chunk;
     luby_visibility visibility;   // method visibility
@@ -3501,6 +3506,27 @@ static int luby_vm_push_frame(luby_state *L, luby_vm *vm, luby_proc *proc, luby_
         luby_set_global(L, name, block);
     }
 
+    // Save/clear local variables so they don't leak into the callee's scope
+    f->local_count = (proc && proc->local_count > 0) ? proc->local_count : 0;
+    f->local_existed = NULL;
+    f->local_saved = NULL;
+    if (f->local_count > 0) {
+        f->local_existed = (int *)luby_alloc_raw(L, NULL, f->local_count * sizeof(int));
+        f->local_saved = (luby_value *)luby_alloc_raw(L, NULL, f->local_count * sizeof(luby_value));
+        if (f->local_existed && f->local_saved) {
+            for (size_t i = 0; i < f->local_count; i++) {
+                luby_string_view name = { proc->local_names[i], strlen(proc->local_names[i]) };
+                int idx = luby_find_global(L, name);
+                f->local_existed[i] = idx;
+                if (idx >= 0) {
+                    f->local_saved[i] = L->global_values[idx];
+                    // Remove the local so it starts fresh in this function call
+                    luby_remove_global(L, name);
+                }
+            }
+        }
+    }
+
     return 1;
 }
 
@@ -3525,11 +3551,29 @@ static void luby_vm_pop_frame(luby_state *L, luby_vm *vm, luby_value ret, int pu
         luby_remove_global(L, name);
     }
 
+    // Restore local variables
+    if (f->proc && f->local_count > 0 && f->local_existed && f->local_saved) {
+        for (size_t i = 0; i < f->local_count; i++) {
+            luby_string_view name = { f->proc->local_names[i], strlen(f->proc->local_names[i]) };
+            // First remove whatever the function body left behind
+            luby_remove_global(L, name);
+            // Then restore if it existed before
+            if (f->local_existed[i] >= 0) {
+                luby_set_global(L, name, f->local_saved[i]);
+            }
+        }
+    }
+
     if (f->param_existed) luby_alloc_raw(L, f->param_existed, 0);
     if (f->param_saved) luby_alloc_raw(L, f->param_saved, 0);
     f->param_existed = NULL;
     f->param_saved = NULL;
     f->param_count = 0;
+    if (f->local_existed) luby_alloc_raw(L, f->local_existed, 0);
+    if (f->local_saved) luby_alloc_raw(L, f->local_saved, 0);
+    f->local_existed = NULL;
+    f->local_saved = NULL;
+    f->local_count = 0;
 
     if (f->set_self) {
         luby_string_view self_name = { "self", 4 };
@@ -4088,7 +4132,8 @@ set_index_done:
                         }
                     }
 
-                    if (!fn) {
+                    /* Check user-defined procs FIRST so they can shadow builtins */
+                    {
                         luby_string_view sv = { fname, fname ? strlen(fname) : 0 };
                         luby_value gv = luby_get_global(L, sv);
                         if (gv.type == LUBY_T_PROC && gv.as.ptr) {
@@ -4102,6 +4147,8 @@ set_index_done:
                             }
                             goto vm_next_frame;
                         }
+                    }
+                    if (!fn) {
                         luby_set_error(L, LUBY_E_NAME, "undefined function", f->filename, line, 0);
                         goto vm_error;
                     } else {
@@ -4568,6 +4615,150 @@ static luby_proc *luby_compile_block_proc(luby_compiler *C, luby_ast_node *lambd
     return proc;
 }
 
+/* Walk AST to collect variable names assigned in function body (excluding params). */
+static void luby_collect_locals(luby_state *L, luby_ast_node *node,
+                                char ***names, size_t *count,
+                                char **param_names, size_t param_count) {
+    if (!node) return;
+    switch (node->kind) {
+    case LUBY_AST_ASSIGN: {
+        luby_ast_node *tgt = node->as.assign.target;
+        if (tgt && tgt->kind == LUBY_AST_IDENT) {
+            const char *nm = tgt->as.literal.data;
+            size_t nl = tgt->as.literal.length;
+            /* Skip if it's a param name */
+            int is_param = 0;
+            for (size_t i = 0; i < param_count; i++) {
+                if (param_names[i] && strlen(param_names[i]) == nl &&
+                    memcmp(param_names[i], nm, nl) == 0) {
+                    is_param = 1; break;
+                }
+            }
+            if (!is_param) {
+                /* Skip if already collected */
+                int dup = 0;
+                for (size_t i = 0; i < *count; i++) {
+                    if (strlen((*names)[i]) == nl &&
+                        memcmp((*names)[i], nm, nl) == 0) {
+                        dup = 1; break;
+                    }
+                }
+                if (!dup) {
+                    *names = (char **)luby_alloc_raw(L, *names, (*count + 1) * sizeof(char *));
+                    (*names)[*count] = luby_dup_string(L, nm, nl);
+                    (*count)++;
+                }
+            }
+        }
+        luby_collect_locals(L, node->as.assign.value, names, count, param_names, param_count);
+        break;
+    }
+    case LUBY_AST_MULTI_ASSIGN: {
+        for (size_t i = 0; i < node->as.multi_assign.target_count; i++) {
+            luby_ast_node *tgt = node->as.multi_assign.targets[i];
+            if (tgt && tgt->kind == LUBY_AST_IDENT) {
+                const char *nm = tgt->as.literal.data;
+                size_t nl = tgt->as.literal.length;
+                int is_param = 0;
+                for (size_t j = 0; j < param_count; j++) {
+                    if (param_names[j] && strlen(param_names[j]) == nl &&
+                        memcmp(param_names[j], nm, nl) == 0) {
+                        is_param = 1; break;
+                    }
+                }
+                if (!is_param) {
+                    int dup = 0;
+                    for (size_t j = 0; j < *count; j++) {
+                        if (strlen((*names)[j]) == nl &&
+                            memcmp((*names)[j], nm, nl) == 0) {
+                            dup = 1; break;
+                        }
+                    }
+                    if (!dup) {
+                        *names = (char **)luby_alloc_raw(L, *names, (*count + 1) * sizeof(char *));
+                        (*names)[*count] = luby_dup_string(L, nm, nl);
+                        (*count)++;
+                    }
+                }
+            }
+        }
+        for (size_t i = 0; i < node->as.multi_assign.value_count; i++)
+            luby_collect_locals(L, node->as.multi_assign.values[i], names, count, param_names, param_count);
+        break;
+    }
+    /* Don't descend into nested def/class/module — those have their own scope */
+    case LUBY_AST_DEF:
+    case LUBY_AST_CLASS:
+    case LUBY_AST_MODULE:
+        break;
+    /* Recurse into statement-like nodes */
+    case LUBY_AST_IF:
+    case LUBY_AST_TERNARY:
+        luby_collect_locals(L, node->as.if_stmt.cond, names, count, param_names, param_count);
+        luby_collect_locals(L, node->as.if_stmt.then_branch, names, count, param_names, param_count);
+        luby_collect_locals(L, node->as.if_stmt.else_branch, names, count, param_names, param_count);
+        break;
+    case LUBY_AST_WHILE:
+        luby_collect_locals(L, node->as.while_stmt.cond, names, count, param_names, param_count);
+        luby_collect_locals(L, node->as.while_stmt.body, names, count, param_names, param_count);
+        break;
+    case LUBY_AST_RETURN:
+        luby_collect_locals(L, node->as.ret.value, names, count, param_names, param_count);
+        break;
+    case LUBY_AST_BEGIN:
+        luby_collect_locals(L, node->as.begin.body, names, count, param_names, param_count);
+        luby_collect_locals(L, node->as.begin.rescue_body, names, count, param_names, param_count);
+        luby_collect_locals(L, node->as.begin.ensure_body, names, count, param_names, param_count);
+        break;
+    case LUBY_AST_BINARY:
+        luby_collect_locals(L, node->as.binary.left, names, count, param_names, param_count);
+        luby_collect_locals(L, node->as.binary.right, names, count, param_names, param_count);
+        break;
+    case LUBY_AST_UNARY:
+        luby_collect_locals(L, node->as.unary.expr, names, count, param_names, param_count);
+        break;
+    case LUBY_AST_CALL:
+        luby_collect_locals(L, node->as.call.recv, names, count, param_names, param_count);
+        for (size_t i = 0; i < node->as.call.argc; i++)
+            luby_collect_locals(L, node->as.call.args[i], names, count, param_names, param_count);
+        luby_collect_locals(L, node->as.call.block, names, count, param_names, param_count);
+        break;
+    case LUBY_AST_INDEX:
+        luby_collect_locals(L, node->as.index.target, names, count, param_names, param_count);
+        luby_collect_locals(L, node->as.index.index, names, count, param_names, param_count);
+        break;
+    case LUBY_AST_INDEX_ASSIGN:
+        luby_collect_locals(L, node->as.index_assign.target, names, count, param_names, param_count);
+        luby_collect_locals(L, node->as.index_assign.index, names, count, param_names, param_count);
+        luby_collect_locals(L, node->as.index_assign.value, names, count, param_names, param_count);
+        break;
+    case LUBY_AST_BLOCK:
+        for (size_t i = 0; i < node->as.list.count; i++)
+            luby_collect_locals(L, node->as.list.items[i], names, count, param_names, param_count);
+        break;
+    case LUBY_AST_LAMBDA:
+        /* Descend into lambda body so their assigns are captured as locals of the enclosing function */
+        luby_collect_locals(L, node->as.lambda.body, names, count, param_names, param_count);
+        break;
+    case LUBY_AST_RANGE:
+        luby_collect_locals(L, node->as.range.start, names, count, param_names, param_count);
+        luby_collect_locals(L, node->as.range.end, names, count, param_names, param_count);
+        break;
+    case LUBY_AST_PAIR:
+        luby_collect_locals(L, node->as.pair.left, names, count, param_names, param_count);
+        luby_collect_locals(L, node->as.pair.right, names, count, param_names, param_count);
+        break;
+    case LUBY_AST_INTERP_STRING:
+    case LUBY_AST_ARRAY:
+    case LUBY_AST_HASH:
+        for (size_t i = 0; i < node->as.list.count; i++)
+            luby_collect_locals(L, node->as.list.items[i], names, count, param_names, param_count);
+        break;
+    default:
+        break;
+    }
+}
+
 static luby_proc *luby_compile_def_proc(luby_compiler *C, luby_ast_node *defn) {
     if (!defn || defn->kind != LUBY_AST_DEF) return NULL;
     luby_proc *proc = (luby_proc *)luby_alloc_raw(C->L, NULL, sizeof(luby_proc));
@@ -4616,6 +4807,13 @@ static luby_proc *luby_compile_def_proc(luby_compiler *C, luby_ast_node *defn) {
     sub.loop_depth = 0;
     if (!luby_compile_node(&sub, defn->as.defn.body)) return NULL;
     
+    // Collect local variable names from function body (excluding params)
+    proc->local_names = NULL;
+    proc->local_count = 0;
+    luby_collect_locals(C->L, defn->as.defn.body,
+                        &proc->local_names, &proc->local_count,
+                        proc->param_names, proc->param_count);
+
     // Set visibility from current state
     proc->visibility = C->L->current_visibility;
     

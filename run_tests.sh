@@ -71,6 +71,7 @@ run_test "game_math"
 run_test "string_array"
 run_test "euler"
 run_test "rosetta"
+run_test "scope_shadow"
 
 # Summary
 echo "=================================="
