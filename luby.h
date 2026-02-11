@@ -4714,7 +4714,12 @@ static int luby_compile_node(luby_compiler *C, luby_ast_node *node) {
             if (!luby_compile_node(C, node->as.binary.left)) return 0;
             if (!luby_compile_node(C, node->as.binary.right)) return 0;
             luby_op op = luby_binary_op_from_token(node->as.binary.op);
-            luby_chunk_emit(C->L, C->chunk, op, 0, 0, 0, node->line);
+            if (node->as.binary.op == LUBY_TOK_NEQ) {
+                luby_chunk_emit(C->L, C->chunk, LUBY_OP_EQ, 0, 0, 0, node->line);
+                luby_chunk_emit(C->L, C->chunk, LUBY_OP_NOT, 0, 0, 0, node->line);
+            } else {
+                luby_chunk_emit(C->L, C->chunk, op, 0, 0, 0, node->line);
+            }
             return 1;
         }
         case LUBY_AST_CALL:
