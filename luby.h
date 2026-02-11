@@ -3696,7 +3696,30 @@ static int luby_vm_run(luby_state *L, luby_vm *vm, luby_value *out) {
                     if (vm->sp - f->stack_base < 2) { luby_set_error(L, LUBY_E_RUNTIME, "stack underflow", f->filename, line, 0); goto vm_error; }
                     luby_value b = vm->stack[--vm->sp];
                     luby_value a = vm->stack[--vm->sp];
-                    if (a.type == LUBY_T_INT && b.type == LUBY_T_INT) {
+                    if (inst.op == LUBY_OP_ADD && a.type == LUBY_T_STRING && b.type == LUBY_T_STRING) {
+                        const char *sa = a.as.ptr ? (const char *)a.as.ptr : "";
+                        const char *sb = b.as.ptr ? (const char *)b.as.ptr : "";
+                        size_t la = strlen(sa), lb = strlen(sb);
+                        char *buf = (char *)luby_alloc_raw(L, NULL, la + lb + 1);
+                        if (!buf) { luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
+                        memcpy(buf, sa, la);
+                        memcpy(buf + la, sb, lb);
+                        buf[la + lb] = '\0';
+                        luby_value sv; sv.type = LUBY_T_STRING; sv.as.ptr = buf;
+                        vm->stack[vm->sp++] = sv;
+                    } else if (inst.op == LUBY_OP_ADD && a.type == LUBY_T_ARRAY && b.type == LUBY_T_ARRAY) {
+                        luby_array *aa = (luby_array *)a.as.ptr;
+                        luby_array *ba = (luby_array *)b.as.ptr;
+                        size_t ac = aa ? aa->count : 0, bc = ba ? ba->count : 0;
+                        luby_array *ra = (luby_array *)luby_alloc_raw(L, NULL, sizeof(luby_array));
+                        if (!ra) { luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
+                        ra->count = ac + bc; ra->capacity = ac + bc > 0 ? ac + bc : 1; ra->frozen = 0;
+                        ra->items = (luby_value *)luby_alloc_raw(L, NULL, ra->capacity * sizeof(luby_value));
+                        if (ac > 0) memcpy(ra->items, aa->items, ac * sizeof(luby_value));
+                        if (bc > 0) memcpy(ra->items + ac, ba->items, bc * sizeof(luby_value));
+                        luby_value rv; rv.type = LUBY_T_ARRAY; rv.as.ptr = ra;
+                        vm->stack[vm->sp++] = rv;
+                    } else if (a.type == LUBY_T_INT && b.type == LUBY_T_INT) {
                         int64_t r = 0;
                         if (inst.op == LUBY_OP_ADD) r = a.as.i + b.as.i;
                         else if (inst.op == LUBY_OP_SUB) r = a.as.i - b.as.i;
@@ -3751,17 +3774,25 @@ static int luby_vm_run(luby_state *L, luby_vm *vm, luby_value *out) {
                     luby_value b = vm->stack[--vm->sp];
                     luby_value a = vm->stack[--vm->sp];
                     int res = 0;
-                    if (a.type == LUBY_T_INT && b.type == LUBY_T_INT) {
-                        if (inst.op == LUBY_OP_EQ) res = (a.as.i == b.as.i);
-                        else if (inst.op == LUBY_OP_LT) res = (a.as.i < b.as.i);
+                    if (inst.op == LUBY_OP_EQ) {
+                        res = luby_value_eq(a, b);
+                    } else if (a.type == LUBY_T_INT && b.type == LUBY_T_INT) {
+                        if (inst.op == LUBY_OP_LT) res = (a.as.i < b.as.i);
                         else if (inst.op == LUBY_OP_LTE) res = (a.as.i <= b.as.i);
                         else if (inst.op == LUBY_OP_GT) res = (a.as.i > b.as.i);
                         else res = (a.as.i >= b.as.i);
+                    } else if ((a.type == LUBY_T_STRING || a.type == LUBY_T_SYMBOL) && a.type == b.type) {
+                        const char *sa = a.as.ptr ? (const char *)a.as.ptr : "";
+                        const char *sb = b.as.ptr ? (const char *)b.as.ptr : "";
+                        int cmp = strcmp(sa, sb);
+                        if (inst.op == LUBY_OP_LT) res = (cmp < 0);
+                        else if (inst.op == LUBY_OP_LTE) res = (cmp <= 0);
+                        else if (inst.op == LUBY_OP_GT) res = (cmp > 0);
+                        else res = (cmp >= 0);
                     } else {
                         double af = (a.type == LUBY_T_FLOAT) ? a.as.f : (double)a.as.i;
                         double bf = (b.type == LUBY_T_FLOAT) ? b.as.f : (double)b.as.i;
-                        if (inst.op == LUBY_OP_EQ) res = (af == bf);
-                        else if (inst.op == LUBY_OP_LT) res = (af < bf);
+                        if (inst.op == LUBY_OP_LT) res = (af < bf);
                         else if (inst.op == LUBY_OP_LTE) res = (af <= bf);
                         else if (inst.op == LUBY_OP_GT) res = (af > bf);
                         else res = (af >= bf);
@@ -3820,6 +3851,13 @@ static int luby_vm_run(luby_state *L, luby_vm *vm, luby_value *out) {
                         luby_array *arr = (luby_array *)target.as.ptr;
                         int64_t idx = index.as.i;
                         if (idx >= 0 && (size_t)idx < arr->count) r = arr->items[idx];
+                    } else if ((target.type == LUBY_T_STRING || target.type == LUBY_T_SYMBOL) && target.as.ptr && index.type == LUBY_T_INT) {
+                        const char *str = (const char *)target.as.ptr;
+                        size_t slen = strlen(str);
+                        int64_t idx = index.as.i;
+                        if (idx >= 0 && (size_t)idx < slen) {
+                            r = luby_string(L, str + idx, 1);
+                        }
                     } else if (target.type == LUBY_T_HASH && target.as.ptr) {
                         luby_hash *h = (luby_hash *)target.as.ptr;
                         for (size_t i = 0; i < h->count; i++) {
@@ -7201,7 +7239,22 @@ static int luby_str_join(luby_state *L, int argc, const luby_value *argv, luby_v
 }
 
 static int luby_array_reverse(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
-    if (argc < 1 || argv[0].type != LUBY_T_ARRAY || !argv[0].as.ptr) return (int)LUBY_E_TYPE;
+    if (argc < 1 || !argv[0].as.ptr) return (int)LUBY_E_TYPE;
+    /* String reverse */
+    if (argv[0].type == LUBY_T_STRING || argv[0].type == LUBY_T_SYMBOL) {
+        const char *src = (const char *)argv[0].as.ptr;
+        size_t slen = strlen(src);
+        char *dst = (char *)luby_alloc_raw(L, NULL, slen + 1);
+        if (!dst) return (int)LUBY_E_OOM;
+        for (size_t i = 0; i < slen; i++) {
+            dst[i] = src[slen - 1 - i];
+        }
+        dst[slen] = '\0';
+        if (out) { out->type = LUBY_T_STRING; out->as.ptr = dst; }
+        return (int)LUBY_E_OK;
+    }
+    /* Array reverse */
+    if (argv[0].type != LUBY_T_ARRAY) return (int)LUBY_E_TYPE;
     luby_array *src = (luby_array *)argv[0].as.ptr;
     luby_array *dst = (luby_array *)luby_alloc_raw(L, NULL, sizeof(luby_array));
     if (!dst) return (int)LUBY_E_OOM;

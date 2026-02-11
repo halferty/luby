@@ -68,6 +68,8 @@ run_test "file_line"
 run_test "visibility"
 run_test "numeric"
 run_test "game_math"
+run_test "string_array"
+run_test "euler"
 
 # Summary
 echo "=================================="
