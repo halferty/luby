@@ -153,6 +153,7 @@ typedef enum luby_token_kind {
     LUBY_TOK_RESCUE,
     LUBY_TOK_ENSURE,
     LUBY_TOK_RAISE,
+    LUBY_TOK_RETRY,
     LUBY_TOK_REQUIRE,
     LUBY_TOK_LOAD,
     LUBY_TOK_INCLUDE,
@@ -166,6 +167,7 @@ typedef enum luby_token_kind {
     LUBY_TOK_PRIVATE,
     LUBY_TOK_PUBLIC,
     LUBY_TOK_PROTECTED,
+    LUBY_TOK_MODULE_FUNCTION,
     LUBY_TOK_ALIAS,
 
     // Punctuation / operators
@@ -250,6 +252,7 @@ typedef enum luby_ast_kind {
     LUBY_AST_IDENT,
     LUBY_AST_CONST,
     LUBY_AST_IVAR,            // instance variable @x
+    LUBY_AST_CVAR,            // class variable @@x
     LUBY_AST_RANGE,           // 1..3 or 1...3
 
     LUBY_AST_ARRAY,
@@ -275,9 +278,11 @@ typedef enum luby_ast_kind {
     LUBY_AST_BLOCK_PARAM,     // &block
     LUBY_AST_KWARG_PARAM,     // name: or name: default_value
     LUBY_AST_BEGIN,
+    LUBY_AST_RETRY,
     LUBY_AST_ASSIGN,
     LUBY_AST_MULTI_ASSIGN,    // a, b = 1, 2
     LUBY_AST_IVAR_ASSIGN,     // @x = value
+    LUBY_AST_CVAR_ASSIGN,     // @@x = value
     LUBY_AST_INDEX_ASSIGN,
     LUBY_AST_BINARY,
     LUBY_AST_UNARY
@@ -310,7 +315,7 @@ typedef struct luby_ast_node {
         struct { struct luby_ast_node *cond; struct luby_ast_node *then_branch; struct luby_ast_node *else_branch; } if_stmt;
         struct { struct luby_ast_node *cond; struct luby_ast_node *body; } while_stmt;
         struct { struct luby_ast_node *value; } ret;
-        struct { struct luby_ast_node *body; struct luby_ast_node *rescue_body; struct luby_ast_node *ensure_body; } begin;
+        struct { struct luby_ast_node *body; struct luby_ast_node *rescue_body; struct luby_ast_node *ensure_body; luby_string_view rescue_var; } begin;
         struct { struct luby_ast_node *start; struct luby_ast_node *end; int exclusive; } range;
         struct {
             luby_token_kind op;
@@ -363,6 +368,8 @@ typedef enum luby_op {
     LUBY_OP_ENTER_ENSURE,
     LUBY_OP_END_TRY,
     LUBY_OP_THROW,
+    LUBY_OP_PUSH_ERROR,
+    LUBY_OP_RETRY,
     LUBY_OP_MAKE_ARRAY,
     LUBY_OP_MAKE_HASH,
     LUBY_OP_ADD,
@@ -383,6 +390,8 @@ typedef enum luby_op {
     LUBY_OP_CONCAT,       // concatenate N strings from stack
     LUBY_OP_GET_IVAR,     // get instance variable
     LUBY_OP_SET_IVAR,     // set instance variable
+    LUBY_OP_GET_CVAR,     // get class variable
+    LUBY_OP_SET_CVAR,     // set class variable
     LUBY_OP_MAKE_RANGE,   // create range from stack (a=exclusive flag)
     LUBY_OP_MULTI_UNPACK, // unpack for multi-assign (a=target_count, b=value_count)
     LUBY_OP_DUP           // duplicate top of stack
@@ -417,6 +426,10 @@ typedef struct luby_compiler {
         size_t break_count;
         size_t break_capacity;
     } loops[16];
+    int begin_depth;
+    struct {
+        size_t body_ip;
+    } begins[16];
 } luby_compiler;
 
 typedef struct luby_vm_handler {
@@ -609,6 +622,7 @@ struct luby_state {
     luby_class_obj *current_method_class;
     const char *current_method_name;
     luby_visibility current_visibility;  // current visibility mode for method definitions
+    int module_function_mode;             // when true, new methods become module functions
     luby_coroutine *current_coroutine;
     luby_vm *current_vm;
     size_t method_epoch;
@@ -711,6 +725,9 @@ struct luby_class_obj {
     size_t method_cache_epoch;
     luby_hash *singleton_cache;
     size_t singleton_cache_epoch;
+    char **cvar_names;        // class variable names
+    luby_value *cvar_values;  // class variable values
+    size_t cvar_count;        // number of class variables
     int frozen;
 };
 
@@ -872,6 +889,9 @@ static void luby_gc_mark_obj(luby_gc_obj *obj) {
             }
             for (size_t i = 0; i < cls->prepended_count; i++) {
                 if (cls->prepended_modules[i]) luby_gc_mark_obj(&cls->prepended_modules[i]->gc);
+            }
+            for (size_t i = 0; i < cls->cvar_count; i++) {
+                luby_gc_mark_value(cls->cvar_values[i]);
             }
             break;
         }
@@ -1059,6 +1079,13 @@ static void luby_gc_free_obj(luby_state *L, luby_gc_obj *obj) {
             if (cls->name) luby_alloc_raw(L, cls->name, 0);
             if (cls->included_modules) luby_alloc_raw(L, cls->included_modules, 0);
             if (cls->prepended_modules) luby_alloc_raw(L, cls->prepended_modules, 0);
+            if (cls->cvar_names) {
+                for (size_t i = 0; i < cls->cvar_count; i++) {
+                    luby_alloc_raw(L, cls->cvar_names[i], 0);
+                }
+                luby_alloc_raw(L, cls->cvar_names, 0);
+            }
+            if (cls->cvar_values) luby_alloc_raw(L, cls->cvar_values, 0);
             // methods, singleton_methods, method_cache, singleton_cache are GC hashes
             luby_alloc_raw(L, obj, 0);
             break;
@@ -1324,6 +1351,9 @@ static luby_class_obj *luby_class_new(luby_state *L, const char *name, luby_clas
     cls->method_cache_epoch = 0;
     cls->singleton_cache = luby_hash_new_heap(L);
     cls->singleton_cache_epoch = 0;
+    cls->cvar_names = NULL;
+    cls->cvar_values = NULL;
+    cls->cvar_count = 0;
     cls->frozen = 0;
     L->gc_paused = was_paused;
     return cls;
@@ -1742,6 +1772,15 @@ static void luby_print_value(luby_value v) {
             printf("}");
             break;
         }
+        case LUBY_T_RANGE: {
+            luby_range *r = (luby_range *)v.as.ptr;
+            if (r) {
+                luby_print_value(r->start);
+                printf(r->exclusive ? "..." : "..");
+                luby_print_value(r->end);
+            }
+            break;
+        }
         default:
             printf("<%s>", luby_type_name(v));
             break;
@@ -1914,6 +1953,7 @@ static luby_token luby_lexer_next(luby_lexer *lex) {
         LUBY_KW("rescue", LUBY_TOK_RESCUE);
         LUBY_KW("ensure", LUBY_TOK_ENSURE);
         LUBY_KW("raise", LUBY_TOK_RAISE);
+        LUBY_KW("retry", LUBY_TOK_RETRY);
         LUBY_KW("require", LUBY_TOK_REQUIRE);
         LUBY_KW("load", LUBY_TOK_LOAD);
         LUBY_KW("include", LUBY_TOK_INCLUDE);
@@ -1927,6 +1967,7 @@ static luby_token luby_lexer_next(luby_lexer *lex) {
         LUBY_KW("private", LUBY_TOK_PRIVATE);
         LUBY_KW("public", LUBY_TOK_PUBLIC);
         LUBY_KW("protected", LUBY_TOK_PROTECTED);
+        LUBY_KW("module_function", LUBY_TOK_MODULE_FUNCTION);
         LUBY_KW("alias", LUBY_TOK_ALIAS);
         #undef LUBY_KW
 
@@ -2119,6 +2160,7 @@ static luby_ast_node *luby_dup_ast(luby_state *L, luby_ast_node *node) {
         case LUBY_AST_IDENT:
         case LUBY_AST_CONST:
         case LUBY_AST_IVAR:
+        case LUBY_AST_CVAR:
         case LUBY_AST_REDO:
         case LUBY_AST_SPLAT_PARAM:
         case LUBY_AST_BLOCK_PARAM:
@@ -2151,6 +2193,7 @@ static luby_ast_node *luby_dup_ast(luby_state *L, luby_ast_node *node) {
             break;
         case LUBY_AST_ASSIGN:
         case LUBY_AST_IVAR_ASSIGN:
+        case LUBY_AST_CVAR_ASSIGN:
         case LUBY_AST_DEFAULT_PARAM:
         case LUBY_AST_KWARG_PARAM:
             copy->as.assign.target = luby_dup_ast(L, node->as.assign.target);
@@ -2243,6 +2286,9 @@ static luby_ast_node *luby_dup_ast(luby_state *L, luby_ast_node *node) {
             copy->as.begin.body = luby_dup_ast(L, node->as.begin.body);
             copy->as.begin.rescue_body = luby_dup_ast(L, node->as.begin.rescue_body);
             copy->as.begin.ensure_body = luby_dup_ast(L, node->as.begin.ensure_body);
+            copy->as.begin.rescue_var = node->as.begin.rescue_var;
+            break;
+        case LUBY_AST_RETRY:
             break;
         case LUBY_AST_BINARY:
             copy->as.binary.op = node->as.binary.op;
@@ -2270,6 +2316,7 @@ static void luby_free_ast(luby_state *L, luby_ast_node *node) {
         case LUBY_AST_IDENT:
         case LUBY_AST_CONST:
         case LUBY_AST_IVAR:
+        case LUBY_AST_CVAR:
         case LUBY_AST_REDO:
             // Leaf nodes, nothing to free
             break;
@@ -2295,6 +2342,7 @@ static void luby_free_ast(luby_state *L, luby_ast_node *node) {
             break;
         case LUBY_AST_ASSIGN:
         case LUBY_AST_IVAR_ASSIGN:
+        case LUBY_AST_CVAR_ASSIGN:
             luby_free_ast(L, node->as.assign.target);
             luby_free_ast(L, node->as.assign.value);
             break;
@@ -2372,6 +2420,8 @@ static void luby_free_ast(luby_state *L, luby_ast_node *node) {
             luby_free_ast(L, node->as.begin.body);
             luby_free_ast(L, node->as.begin.rescue_body);
             luby_free_ast(L, node->as.begin.ensure_body);
+            break;
+        case LUBY_AST_RETRY:
             break;
         case LUBY_AST_BINARY:
             luby_free_ast(L, node->as.binary.left);
@@ -2496,6 +2546,7 @@ static int luby_token_is_name(luby_token_kind kind) {
         case LUBY_TOK_RESCUE:
         case LUBY_TOK_ENSURE:
         case LUBY_TOK_RAISE:
+        case LUBY_TOK_RETRY:
         case LUBY_TOK_REQUIRE:
         case LUBY_TOK_LOAD:
         case LUBY_TOK_INCLUDE:
@@ -2667,6 +2718,12 @@ static luby_ast_node *luby_parse_primary(luby_state *L, luby_parser *p) {
             if (node) node->as.literal = tok.lexeme;
             return node;
         }
+        case LUBY_TOK_CVAR: {
+            luby_parser_advance(p);
+            luby_ast_node *node = luby_new_node(L, LUBY_AST_CVAR, tok.line, tok.column);
+            if (node) node->as.literal = tok.lexeme;
+            return node;
+        }
         case LUBY_TOK_YIELD: {
             luby_parser_advance(p);
             luby_string_view name = { "yield", 5 };
@@ -2721,6 +2778,14 @@ static luby_ast_node *luby_parse_primary(luby_state *L, luby_parser *p) {
         }
         case LUBY_TOK_RAISE: {
             return luby_parse_keyword_call(L, p, "raise", 5);
+        }
+        case LUBY_TOK_RETRY: {
+            luby_token tok = p->current;
+            luby_parser_advance(p);
+            return luby_new_node(L, LUBY_AST_RETRY, tok.line, tok.column);
+        }
+        case LUBY_TOK_BEGIN: {
+            return luby_parse_begin(L, p);
         }
         case LUBY_TOK_ARROW: {
             // Stabby lambda: ->(x, y) { ... } or -> { ... }
@@ -3581,8 +3646,18 @@ static luby_ast_node *luby_parse_begin(luby_state *L, luby_parser *p) {
     luby_ast_node *rescue_body = NULL;
     luby_ast_node *ensure_body = NULL;
 
+    luby_string_view rescue_var = {NULL, 0};
     if (p->current.kind == LUBY_TOK_RESCUE) {
         luby_parser_advance(p);
+        if (p->current.kind == LUBY_TOK_HASHROCKET) {
+            luby_parser_advance(p);
+            if (p->current.kind == LUBY_TOK_IDENTIFIER) {
+                rescue_var = p->current.lexeme;
+                luby_parser_advance(p);
+            } else {
+                luby_parser_error(p, "expected variable name after '=>'");
+            }
+        }
         rescue_body = luby_parse_block_until_any(L, p, LUBY_TOK_ENSURE, LUBY_TOK_END, LUBY_TOK_EOF);
     }
 
@@ -3600,6 +3675,7 @@ static luby_ast_node *luby_parse_begin(luby_state *L, luby_parser *p) {
     node->as.begin.body = body;
     node->as.begin.rescue_body = rescue_body;
     node->as.begin.ensure_body = ensure_body;
+    node->as.begin.rescue_var = rescue_var;
     return node;
 }
 
@@ -3727,6 +3803,7 @@ static luby_ast_node *luby_parse_statement(luby_state *L, luby_parser *p) {
         case LUBY_TOK_PRIVATE: return luby_parse_keyword_call(L, p, "private", 7);
         case LUBY_TOK_PUBLIC: return luby_parse_keyword_call(L, p, "public", 6);
         case LUBY_TOK_PROTECTED: return luby_parse_keyword_call(L, p, "protected", 9);
+        case LUBY_TOK_MODULE_FUNCTION: return luby_parse_keyword_call(L, p, "module_function", 15);
         case LUBY_TOK_ALIAS: return luby_parse_alias(L, p);
         default:
             {
@@ -3877,6 +3954,15 @@ static luby_ast_node *luby_parse_conditional_assign(luby_state *L, luby_parser *
         node->as.assign.value = binop;
         return node;
     }
+    if (lhs->kind == LUBY_AST_CVAR) {
+        luby_ast_node *target = luby_new_node(L, LUBY_AST_CVAR, lhs->line, lhs->column);
+        if (target) target->as.literal = lhs->as.literal;
+        luby_ast_node *node = luby_new_node(L, LUBY_AST_CVAR_ASSIGN, lhs->line, lhs->column);
+        if (!node) return NULL;
+        node->as.assign.target = target;
+        node->as.assign.value = binop;
+        return node;
+    }
     luby_parser_error(p, "invalid conditional assignment target");
     return lhs;
 }
@@ -3927,6 +4013,15 @@ static luby_ast_node *luby_parse_compound_assign(luby_state *L, luby_parser *p, 
         node->as.assign.value = binop;
         return node;
     }
+    if (lhs->kind == LUBY_AST_CVAR) {
+        luby_ast_node *target = luby_new_node(L, LUBY_AST_CVAR, lhs->line, lhs->column);
+        if (target) target->as.literal = lhs->as.literal;
+        luby_ast_node *node = luby_new_node(L, LUBY_AST_CVAR_ASSIGN, lhs->line, lhs->column);
+        if (!node) return NULL;
+        node->as.assign.target = target;
+        node->as.assign.value = binop;
+        return node;
+    }
     luby_parser_error(p, "invalid compound assignment target");
     return lhs;
 }
@@ -3944,6 +4039,13 @@ static luby_ast_node *luby_parse_assignment_from(luby_state *L, luby_parser *p, 
     }
     if (lhs->kind == LUBY_AST_IVAR) {
         luby_ast_node *node = luby_new_node(L, LUBY_AST_IVAR_ASSIGN, lhs->line, lhs->column);
+        if (!node) return NULL;
+        node->as.assign.target = lhs;
+        node->as.assign.value = rhs;
+        return node;
+    }
+    if (lhs->kind == LUBY_AST_CVAR) {
+        luby_ast_node *node = luby_new_node(L, LUBY_AST_CVAR_ASSIGN, lhs->line, lhs->column);
         if (!node) return NULL;
         node->as.assign.target = lhs;
         node->as.assign.value = rhs;
@@ -4146,6 +4248,7 @@ static int luby_vm_handle_error(luby_state *L, luby_vm_handler *handlers, int *h
         *sp = h->sp;
         if (h->phase == 0 && h->rescue_ip != LUBY_IP_NONE) {
             h->phase = 1;
+            h->pending = L->last_error;
             luby_clear_error(L);
             *ip = h->rescue_ip;
             return 1;
@@ -4523,13 +4626,20 @@ static int luby_vm_run(luby_state *L, luby_vm *vm, luby_value *out) {
                     if (!luby_vm_ensure_stack(L, vm, 1)) { luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
                     vm->stack[vm->sp++] = L->current_class;
                     break;
-                case LUBY_OP_SET_CLASS:
+                case LUBY_OP_SET_CLASS: {
+                    luby_value old_class = L->current_class;
                     if (vm->sp > f->stack_base) {
                         L->current_class = vm->stack[--vm->sp];
                     } else {
                         L->current_class = luby_nil();
                     }
+                    // Reset module_function_mode when leaving a module
+                    if (old_class.type == LUBY_T_MODULE && 
+                        (L->current_class.type != LUBY_T_MODULE || L->current_class.as.ptr != old_class.as.ptr)) {
+                        L->module_function_mode = 0;
+                    }
                     break;
+                }
                 case LUBY_OP_MAKE_CLASS: {
                     luby_value namev = chunk->consts[inst.c];
                     const char *name = namev.as.ptr ? (const char *)namev.as.ptr : "<class>";
@@ -4575,7 +4685,13 @@ static int luby_vm_run(luby_state *L, luby_vm *vm, luby_value *out) {
                         luby_class_obj *cls = (luby_class_obj *)L->current_class.as.ptr;
                         if (cls && cls->frozen) { luby_set_error(L, LUBY_E_RUNTIME, "frozen", f->filename, line, 0); goto vm_error; }
                         if (procv.type == LUBY_T_PROC) {
-                            luby_class_set_method(L, cls, mname, (luby_proc *)procv.as.ptr);
+                            luby_proc *proc = (luby_proc *)procv.as.ptr;
+                            luby_class_set_method(L, cls, mname, proc);
+                            // If module_function_mode is on and we're in a module, make it a module function
+                            if (L->module_function_mode && L->current_class.type == LUBY_T_MODULE) {
+                                proc->visibility = LUBY_VIS_PRIVATE;
+                                luby_class_set_singleton_method(L, cls, mname, proc);
+                            }
                         }
                     }
                     break;
@@ -4714,7 +4830,17 @@ static int luby_vm_run(luby_state *L, luby_vm *vm, luby_value *out) {
                     luby_value a = vm->stack[--vm->sp];
                     int res = 0;
                     if (inst.op == LUBY_OP_EQ) {
-                        res = luby_value_eq(a, b);
+                        // Ruby === semantics: Range === value checks inclusion
+                        if (b.type == LUBY_T_RANGE && b.as.ptr && a.type != LUBY_T_RANGE) {
+                            luby_range *rng = (luby_range *)b.as.ptr;
+                            if (rng->start.type == LUBY_T_INT && rng->end.type == LUBY_T_INT && a.type == LUBY_T_INT) {
+                                int64_t s = rng->start.as.i, e = rng->end.as.i;
+                                if (rng->exclusive) e--;
+                                res = (a.as.i >= s && a.as.i <= e);
+                            }
+                        } else {
+                            res = luby_value_eq(a, b);
+                        }
                     } else if (a.type == LUBY_T_INT && b.type == LUBY_T_INT) {
                         if (inst.op == LUBY_OP_LT) res = (a.as.i < b.as.i);
                         else if (inst.op == LUBY_OP_LTE) res = (a.as.i <= b.as.i);
@@ -4796,6 +4922,43 @@ static int luby_vm_run(luby_state *L, luby_vm *vm, luby_value *out) {
                         int64_t idx = index.as.i;
                         if (idx >= 0 && (size_t)idx < slen) {
                             r = luby_string(L, str + idx, 1);
+                        }
+                    } else if (target.type == LUBY_T_ARRAY && target.as.ptr && index.type == LUBY_T_RANGE && index.as.ptr) {
+                        // Array slice with range: arr[1..3] => sub-array
+                        luby_range *rng = (luby_range *)index.as.ptr;
+                        if (rng->start.type == LUBY_T_INT && rng->end.type == LUBY_T_INT) {
+                            luby_array *arr = (luby_array *)target.as.ptr;
+                            int64_t s = rng->start.as.i, e = rng->end.as.i;
+                            if (rng->exclusive) e--;
+                            if (s < 0) s = 0;
+                            if (e >= (int64_t)arr->count) e = (int64_t)arr->count - 1;
+                            int64_t count = (e >= s) ? (e - s + 1) : 0;
+                            int was_paused = L->gc_paused; L->gc_paused = 1;
+                            luby_array *sl = (luby_array *)luby_gc_alloc(L, sizeof(luby_array), LUBY_GC_ARRAY);
+                            if (sl) {
+                                sl->count = (size_t)count; sl->capacity = (size_t)count; sl->frozen = 0;
+                                sl->items = count > 0 ? (luby_value *)luby_alloc_raw(L, NULL, (size_t)count * sizeof(luby_value)) : NULL;
+                                if (sl->items || count == 0) {
+                                    for (int64_t i = 0; i < count; i++) sl->items[i] = arr->items[s + i];
+                                    r.type = LUBY_T_ARRAY; r.as.ptr = sl;
+                                }
+                            }
+                            L->gc_paused = was_paused;
+                        }
+                    } else if ((target.type == LUBY_T_STRING || target.type == LUBY_T_SYMBOL) && target.as.ptr && index.type == LUBY_T_RANGE && index.as.ptr) {
+                        // String slice with range: "hello"[1..3] => "ell"
+                        luby_range *rng = (luby_range *)index.as.ptr;
+                        if (rng->start.type == LUBY_T_INT && rng->end.type == LUBY_T_INT) {
+                            const char *str = (const char *)target.as.ptr;
+                            size_t slen = strlen(str);
+                            int64_t s = rng->start.as.i, e = rng->end.as.i;
+                            if (rng->exclusive) e--;
+                            if (s < 0) s = 0;
+                            if (e >= (int64_t)slen) e = (int64_t)slen - 1;
+                            int64_t count = (e >= s) ? (e - s + 1) : 0;
+                            if (count > 0) {
+                                r = luby_string(L, str + s, (size_t)count);
+                            }
                         }
                     } else if (target.type == LUBY_T_HASH && target.as.ptr) {
                         luby_hash *h = (luby_hash *)target.as.ptr;
@@ -5229,6 +5392,29 @@ set_index_done:
                     luby_set_error(L, LUBY_E_RUNTIME, msg, f->filename, line, 0);
                     goto vm_error;
                 }
+                case LUBY_OP_PUSH_ERROR: {
+                    const char *msg = "error";
+                    if (f->hcount > 0 && f->handlers[f->hcount - 1].pending.message) {
+                        msg = f->handlers[f->hcount - 1].pending.message;
+                    }
+                    size_t len = strlen(msg);
+                    char *buf = luby_gc_alloc_string(L, msg, len);
+                    if (!luby_vm_ensure_stack(L, vm, 1)) { luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
+                    luby_value sv = luby_nil();
+                    sv.type = LUBY_T_STRING;
+                    sv.as.ptr = buf;
+                    vm->stack[vm->sp++] = sv;
+                    break;
+                }
+                case LUBY_OP_RETRY: {
+                    if (f->hcount <= 0) { luby_set_error(L, LUBY_E_RUNTIME, "retry outside rescue", f->filename, line, 0); goto vm_error; }
+                    luby_vm_handler *h = &f->handlers[f->hcount - 1];
+                    h->phase = 0;
+                    h->pending_error = 0;
+                    vm->sp = h->sp;
+                    f->ip = inst.c;
+                    continue;
+                }
                 case LUBY_OP_RET: {
                     luby_value result = (vm->sp > f->stack_base) ? vm->stack[--vm->sp] : luby_nil();
                     luby_vm_pop_frame(L, vm, result, 1);
@@ -5287,6 +5473,89 @@ set_index_done:
                         obj->ivar_names[n] = luby_dup_string(L, name, strlen(name));
                         obj->ivar_values[n] = val;
                         obj->ivar_count = n + 1;
+                    }
+                    break;
+                }
+                case LUBY_OP_GET_CVAR: {
+                    // Get class variable from current class context
+                    luby_class_obj *cls = NULL;
+                    if (L->current_class.type == LUBY_T_CLASS || L->current_class.type == LUBY_T_MODULE) {
+                        cls = (luby_class_obj *)L->current_class.as.ptr;
+                    }
+                    if (!cls) {
+                        // Try to get class from self
+                        luby_value self_val = L->current_self;
+                        if (self_val.type == LUBY_T_OBJECT && self_val.as.ptr) {
+                            cls = ((luby_object *)self_val.as.ptr)->klass;
+                        } else if (self_val.type == LUBY_T_CLASS || self_val.type == LUBY_T_MODULE) {
+                            cls = (luby_class_obj *)self_val.as.ptr;
+                        }
+                    }
+                    luby_value namev = chunk->consts[inst.c];
+                    const char *name = (namev.type == LUBY_T_SYMBOL || namev.type == LUBY_T_STRING) ? (const char *)namev.as.ptr : "";
+                    luby_value result = luby_nil();
+                    // Search up the class hierarchy for the class variable
+                    luby_class_obj *search_cls = cls;
+                    while (search_cls) {
+                        for (size_t i = 0; i < search_cls->cvar_count; i++) {
+                            if (strcmp(search_cls->cvar_names[i], name) == 0) {
+                                result = search_cls->cvar_values[i];
+                                goto cvar_found;
+                            }
+                        }
+                        search_cls = search_cls->super;
+                    }
+                cvar_found:
+                    if (!luby_vm_ensure_stack(L, vm, 1)) { luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
+                    vm->stack[vm->sp++] = result;
+                    break;
+                }
+                case LUBY_OP_SET_CVAR: {
+                    // Set class variable on current class context
+                    luby_class_obj *cls = NULL;
+                    if (L->current_class.type == LUBY_T_CLASS || L->current_class.type == LUBY_T_MODULE) {
+                        cls = (luby_class_obj *)L->current_class.as.ptr;
+                    }
+                    if (!cls) {
+                        // Try to get class from self
+                        luby_value self_val = L->current_self;
+                        if (self_val.type == LUBY_T_OBJECT && self_val.as.ptr) {
+                            cls = ((luby_object *)self_val.as.ptr)->klass;
+                        } else if (self_val.type == LUBY_T_CLASS || self_val.type == LUBY_T_MODULE) {
+                            cls = (luby_class_obj *)self_val.as.ptr;
+                        }
+                    }
+                    if (!cls) {
+                        luby_set_error(L, LUBY_E_RUNTIME, "no class context for class variable", f->filename, line, 0);
+                        goto vm_error;
+                    }
+                    if (vm->sp - f->stack_base < 1) { luby_set_error(L, LUBY_E_RUNTIME, "stack underflow", f->filename, line, 0); goto vm_error; }
+                    luby_value val = vm->stack[vm->sp - 1]; // keep on stack for result
+                    luby_value namev = chunk->consts[inst.c];
+                    const char *name = (namev.type == LUBY_T_SYMBOL || namev.type == LUBY_T_STRING) ? (const char *)namev.as.ptr : "";
+                    // Search up the hierarchy for existing cvar to update
+                    int found = 0;
+                    luby_class_obj *search_cls = cls;
+                    while (search_cls) {
+                        for (size_t i = 0; i < search_cls->cvar_count; i++) {
+                            if (strcmp(search_cls->cvar_names[i], name) == 0) {
+                                search_cls->cvar_values[i] = val;
+                                found = 1;
+                                goto cvar_set_done;
+                            }
+                        }
+                        search_cls = search_cls->super;
+                    }
+                cvar_set_done:
+                    if (!found) {
+                        // Add new cvar to the current class (not parent)
+                        size_t n = cls->cvar_count;
+                        cls->cvar_names = (char **)luby_alloc_raw(L, cls->cvar_names, (n + 1) * sizeof(char *));
+                        cls->cvar_values = (luby_value *)luby_alloc_raw(L, cls->cvar_values, (n + 1) * sizeof(luby_value));
+                        if (!cls->cvar_names || !cls->cvar_values) { luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
+                        cls->cvar_names[n] = luby_dup_string(L, name, strlen(name));
+                        cls->cvar_values[n] = val;
+                        cls->cvar_count = n + 1;
                     }
                     break;
                 }
@@ -5503,6 +5772,7 @@ static luby_proc *luby_compile_block_proc(luby_compiler *C, luby_ast_node *lambd
                 dsub.chunk = &proc->default_chunks[i];
                 dsub.class_depth = 0;
                 dsub.loop_depth = 0;
+                dsub.begin_depth = 0;
                 luby_compile_node(&dsub, param->as.assign.value);
             } else if (param->kind == LUBY_AST_SPLAT_PARAM) {
                 proc->param_names[i] = luby_dup_string(C->L, param->as.literal.data, param->as.literal.length);
@@ -5523,6 +5793,7 @@ static luby_proc *luby_compile_block_proc(luby_compiler *C, luby_ast_node *lambd
     sub.chunk = &proc->chunk;
     sub.class_depth = 0;
     sub.loop_depth = 0;
+    sub.begin_depth = 0;
     if (!luby_compile_node(&sub, lambda->as.lambda.body)) return NULL;
     
     // Blocks and lambdas are always public
@@ -5626,6 +5897,8 @@ static void luby_collect_locals(luby_state *L, luby_ast_node *node,
         luby_collect_locals(L, node->as.begin.rescue_body, names, count, param_names, param_count);
         luby_collect_locals(L, node->as.begin.ensure_body, names, count, param_names, param_count);
         break;
+    case LUBY_AST_RETRY:
+        break;
     case LUBY_AST_BINARY:
         luby_collect_locals(L, node->as.binary.left, names, count, param_names, param_count);
         luby_collect_locals(L, node->as.binary.right, names, count, param_names, param_count);
@@ -5719,6 +5992,7 @@ static luby_proc *luby_compile_def_proc(luby_compiler *C, luby_ast_node *defn) {
                     dsub.chunk = &proc->kwarg_default_chunks[ki];
                     dsub.class_depth = 0;
                     dsub.loop_depth = 0;
+                    dsub.begin_depth = 0;
                     luby_compile_node(&dsub, param->as.assign.value);
                 }
                 ki++;
@@ -5731,6 +6005,7 @@ static luby_proc *luby_compile_def_proc(luby_compiler *C, luby_ast_node *defn) {
                     dsub.chunk = &proc->default_chunks[pi];
                     dsub.class_depth = 0;
                     dsub.loop_depth = 0;
+                    dsub.begin_depth = 0;
                     luby_compile_node(&dsub, param->as.assign.value);
                 } else if (param->kind == LUBY_AST_SPLAT_PARAM) {
                     proc->param_names[pi] = luby_dup_string(C->L, param->as.literal.data, param->as.literal.length);
@@ -5753,6 +6028,7 @@ static luby_proc *luby_compile_def_proc(luby_compiler *C, luby_ast_node *defn) {
     sub.chunk = &proc->chunk;
     sub.class_depth = 0;
     sub.loop_depth = 0;
+    sub.begin_depth = 0;
     if (!luby_compile_node(&sub, defn->as.defn.body)) return NULL;
     
     // Collect local variable names from function body (excluding params and kwargs)
@@ -5958,6 +6234,11 @@ static int luby_compile_node(luby_compiler *C, luby_ast_node *node) {
                     uint32_t idx = luby_chunk_add_const(C->L, C->chunk, sym);
                     luby_chunk_emit(C->L, C->chunk, LUBY_OP_SET_IVAR, 0, 0, idx, node->line);
                     luby_chunk_emit(C->L, C->chunk, LUBY_OP_POP, 0, 0, 0, node->line);
+                } else if (target->kind == LUBY_AST_CVAR) {
+                    luby_value sym = luby_symbol(C->L, target->as.literal.data, target->as.literal.length);
+                    uint32_t idx = luby_chunk_add_const(C->L, C->chunk, sym);
+                    luby_chunk_emit(C->L, C->chunk, LUBY_OP_SET_CVAR, 0, 0, idx, node->line);
+                    luby_chunk_emit(C->L, C->chunk, LUBY_OP_POP, 0, 0, 0, node->line);
                 }
             }
             // Push nil as the result of multi-assign
@@ -5980,6 +6261,21 @@ static int luby_compile_node(luby_compiler *C, luby_ast_node *node) {
             luby_value sym = luby_symbol(C->L, node->as.assign.target->as.literal.data, node->as.assign.target->as.literal.length);
             uint32_t idx = luby_chunk_add_const(C->L, C->chunk, sym);
             luby_chunk_emit(C->L, C->chunk, LUBY_OP_SET_IVAR, 0, 0, idx, node->line);
+            return 1;
+        }
+        case LUBY_AST_CVAR: {
+            // Get class variable
+            luby_value sym = luby_symbol(C->L, node->as.literal.data, node->as.literal.length);
+            uint32_t idx = luby_chunk_add_const(C->L, C->chunk, sym);
+            luby_chunk_emit(C->L, C->chunk, LUBY_OP_GET_CVAR, 0, 0, idx, node->line);
+            return 1;
+        }
+        case LUBY_AST_CVAR_ASSIGN: {
+            // Set class variable
+            if (!luby_compile_node(C, node->as.assign.value)) return 0;
+            luby_value sym = luby_symbol(C->L, node->as.assign.target->as.literal.data, node->as.assign.target->as.literal.length);
+            uint32_t idx = luby_chunk_add_const(C->L, C->chunk, sym);
+            luby_chunk_emit(C->L, C->chunk, LUBY_OP_SET_CVAR, 0, 0, idx, node->line);
             return 1;
         }
         case LUBY_AST_RANGE: {
@@ -6160,6 +6456,13 @@ static int luby_compile_node(luby_compiler *C, luby_ast_node *node) {
                 luby_chunk_emit(C->L, C->chunk, LUBY_OP_SET_ENSURE, 0, 0, LUBY_IP_NONE, node->line);
             }
 
+            size_t body_ip = C->chunk->count;
+            int saved_begin_depth = C->begin_depth;
+            if (C->begin_depth < 16) {
+                C->begins[C->begin_depth].body_ip = body_ip;
+                C->begin_depth++;
+            }
+
             if (!luby_compile_node(C, node->as.begin.body)) return 0;
 
             size_t jump_after_body = 0;
@@ -6171,11 +6474,23 @@ static int luby_compile_node(luby_compiler *C, luby_ast_node *node) {
             size_t jump_after_rescue = 0;
             if (node->as.begin.rescue_body) {
                 rescue_ip = (uint32_t)C->chunk->count;
+                if (node->as.begin.rescue_var.data && node->as.begin.rescue_var.length > 0) {
+                    luby_chunk_emit(C->L, C->chunk, LUBY_OP_PUSH_ERROR, 0, 0, 0, node->line);
+                    char *vname = luby_dup_string(C->L, node->as.begin.rescue_var.data, node->as.begin.rescue_var.length);
+                    luby_value vsym = luby_nil();
+                    vsym.type = LUBY_T_STRING;
+                    vsym.as.ptr = vname;
+                    uint32_t vidx = luby_chunk_add_const(C->L, C->chunk, vsym);
+                    luby_chunk_emit(C->L, C->chunk, LUBY_OP_SET_GLOBAL, 0, 0, vidx, node->line);
+                    luby_chunk_emit(C->L, C->chunk, LUBY_OP_POP, 0, 0, 0, node->line);
+                }
                 if (!luby_compile_node(C, node->as.begin.rescue_body)) return 0;
                 if (node->as.begin.ensure_body) {
                     jump_after_rescue = luby_chunk_emit_jump(C->L, C->chunk, LUBY_OP_JUMP, node->line);
                 }
             }
+
+            C->begin_depth = saved_begin_depth;
 
             uint32_t ensure_ip = LUBY_IP_NONE;
             if (node->as.begin.ensure_body) {
@@ -6195,6 +6510,15 @@ static int luby_compile_node(luby_compiler *C, luby_ast_node *node) {
                 luby_chunk_patch_jump(C->chunk, ensure_at, ensure_ip);
             }
             luby_chunk_emit(C->L, C->chunk, LUBY_OP_END_TRY, 0, 0, 0, node->line);
+            return 1;
+        }
+        case LUBY_AST_RETRY: {
+            if (C->begin_depth <= 0) {
+                luby_set_error(C->L, LUBY_E_PARSE, "retry outside begin/rescue", NULL, node->line, 0);
+                return 0;
+            }
+            size_t target = C->begins[C->begin_depth - 1].body_ip;
+            luby_chunk_emit(C->L, C->chunk, LUBY_OP_RETRY, 0, 0, (uint32_t)target, node->line);
             return 1;
         }
         case LUBY_AST_UNARY: {
@@ -6236,6 +6560,7 @@ LUBY_API luby_state *luby_new(const luby_config *cfg) {
     L->current_method_class = NULL;
     L->current_method_name = NULL;
     L->current_visibility = LUBY_VIS_PUBLIC;  // default visibility is public
+    L->module_function_mode = 0;              // module_function mode is off by default
     L->method_epoch = 1;
     L->current_coroutine = NULL;
     L->current_vm = NULL;
@@ -6377,6 +6702,7 @@ LUBY_API int luby_eval(luby_state *L, const char *code, size_t len, const char *
     C.chunk = &chunk;
     C.class_depth = (L->current_class.type == LUBY_T_CLASS || L->current_class.type == LUBY_T_MODULE) ? 1 : 0;
     C.loop_depth = 0;
+    C.begin_depth = 0;
     if (!luby_compile_node(&C, ast)) {
         luby_free_ast(L, ast);
         luby_chunk_free(L, &chunk);
@@ -6910,6 +7236,18 @@ static int luby_base_len(luby_state *L, int argc, const luby_value *argv, luby_v
         if (out) *out = luby_int((int64_t)h->count);
         return (int)LUBY_E_OK;
     }
+    if (v.type == LUBY_T_RANGE && v.as.ptr) {
+        luby_range *r = (luby_range *)v.as.ptr;
+        if (r->start.type == LUBY_T_INT && r->end.type == LUBY_T_INT) {
+            int64_t s = r->start.as.i, e = r->end.as.i;
+            if (r->exclusive) e--;
+            int64_t count = (e >= s) ? (e - s + 1) : 0;
+            if (out) *out = luby_int(count);
+        } else {
+            if (out) *out = luby_int(0);
+        }
+        return (int)LUBY_E_OK;
+    }
     if (out) *out = luby_int(0);
     return (int)LUBY_E_OK;
 }
@@ -7277,6 +7615,328 @@ static int luby_range_each(luby_state *L, int argc, const luby_value *argv, luby
         if (luby_call_block(L, block, 1, &iv, &res) != 0) return (int)LUBY_E_RUNTIME;
     }
     if (out) *out = argv[0];
+    return (int)LUBY_E_OK;
+}
+
+// Helper: get range bounds as int64, adjusting for exclusive
+static int luby_range_bounds(const luby_value *argv, int64_t *start, int64_t *end) {
+    if (argv[0].type != LUBY_T_RANGE || !argv[0].as.ptr) return 0;
+    luby_range *r = (luby_range *)argv[0].as.ptr;
+    if (r->start.type != LUBY_T_INT || r->end.type != LUBY_T_INT) return 0;
+    *start = r->start.as.i;
+    *end = r->end.as.i;
+    if (r->exclusive) (*end)--;
+    return 1;
+}
+
+// (1..5).to_a => [1,2,3,4,5]
+static int luby_range_to_a(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (argc < 1) return (int)LUBY_E_TYPE;
+    int64_t start, end;
+    if (!luby_range_bounds(argv, &start, &end)) return (int)LUBY_E_TYPE;
+    int64_t count = (end >= start) ? (end - start + 1) : 0;
+    int was_paused = L->gc_paused; L->gc_paused = 1;
+    luby_array *arr = (luby_array *)luby_gc_alloc(L, sizeof(luby_array), LUBY_GC_ARRAY);
+    if (!arr) { L->gc_paused = was_paused; return (int)LUBY_E_OOM; }
+    arr->count = (size_t)count; arr->capacity = (size_t)count; arr->frozen = 0;
+    arr->items = count > 0 ? (luby_value *)luby_alloc_raw(L, NULL, (size_t)count * sizeof(luby_value)) : NULL;
+    if (!arr->items && count > 0) { L->gc_paused = was_paused; return (int)LUBY_E_OOM; }
+    for (int64_t i = 0; i < count; i++) arr->items[i] = luby_int(start + i);
+    L->gc_paused = was_paused;
+    if (out) { out->type = LUBY_T_ARRAY; out->as.ptr = arr; }
+    return (int)LUBY_E_OK;
+}
+
+// (1..5).size => 5
+static int luby_range_size(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    (void)L;
+    if (argc < 1) return (int)LUBY_E_TYPE;
+    int64_t start, end;
+    if (!luby_range_bounds(argv, &start, &end)) return (int)LUBY_E_TYPE;
+    int64_t count = (end >= start) ? (end - start + 1) : 0;
+    if (out) *out = luby_int(count);
+    return (int)LUBY_E_OK;
+}
+
+// (1..10).include?(5) => true
+static int luby_range_include(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    (void)L;
+    if (argc < 2) return (int)LUBY_E_TYPE;
+    int64_t start, end;
+    if (!luby_range_bounds(argv, &start, &end)) return (int)LUBY_E_TYPE;
+    if (argv[1].type != LUBY_T_INT) { if (out) *out = luby_bool(0); return (int)LUBY_E_OK; }
+    int64_t v = argv[1].as.i;
+    if (out) *out = luby_bool(v >= start && v <= end);
+    return (int)LUBY_E_OK;
+}
+
+// (3..7).min => 3
+static int luby_range_min(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    (void)L;
+    if (argc < 1) return (int)LUBY_E_TYPE;
+    int64_t start, end;
+    if (!luby_range_bounds(argv, &start, &end)) return (int)LUBY_E_TYPE;
+    if (out) *out = (start <= end) ? luby_int(start) : luby_nil();
+    return (int)LUBY_E_OK;
+}
+
+// (3..7).max => 7
+static int luby_range_max(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    (void)L;
+    if (argc < 1) return (int)LUBY_E_TYPE;
+    int64_t start, end;
+    if (!luby_range_bounds(argv, &start, &end)) return (int)LUBY_E_TYPE;
+    if (out) *out = (start <= end) ? luby_int(end) : luby_nil();
+    return (int)LUBY_E_OK;
+}
+
+// (1..5).first => 1, (1..5).first(3) => [1,2,3]
+static int luby_range_first(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (argc < 1) return (int)LUBY_E_TYPE;
+    int64_t start, end;
+    if (!luby_range_bounds(argv, &start, &end)) return (int)LUBY_E_TYPE;
+    if (argc >= 2 && argv[1].type == LUBY_T_INT) {
+        int64_t n = argv[1].as.i;
+        int64_t total = (end >= start) ? (end - start + 1) : 0;
+        if (n > total) n = total;
+        if (n < 0) n = 0;
+        int was_paused = L->gc_paused; L->gc_paused = 1;
+        luby_array *arr = (luby_array *)luby_gc_alloc(L, sizeof(luby_array), LUBY_GC_ARRAY);
+        if (!arr) { L->gc_paused = was_paused; return (int)LUBY_E_OOM; }
+        arr->count = (size_t)n; arr->capacity = (size_t)n; arr->frozen = 0;
+        arr->items = n > 0 ? (luby_value *)luby_alloc_raw(L, NULL, (size_t)n * sizeof(luby_value)) : NULL;
+        if (!arr->items && n > 0) { L->gc_paused = was_paused; return (int)LUBY_E_OOM; }
+        for (int64_t i = 0; i < n; i++) arr->items[i] = luby_int(start + i);
+        L->gc_paused = was_paused;
+        if (out) { out->type = LUBY_T_ARRAY; out->as.ptr = arr; }
+    } else {
+        if (out) *out = (start <= end) ? luby_int(start) : luby_nil();
+    }
+    return (int)LUBY_E_OK;
+}
+
+// (1..5).last => 5, (1..5).last(2) => [4,5]
+static int luby_range_last(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (argc < 1) return (int)LUBY_E_TYPE;
+    int64_t start, end;
+    if (!luby_range_bounds(argv, &start, &end)) return (int)LUBY_E_TYPE;
+    if (argc >= 2 && argv[1].type == LUBY_T_INT) {
+        int64_t n = argv[1].as.i;
+        int64_t total = (end >= start) ? (end - start + 1) : 0;
+        if (n > total) n = total;
+        if (n < 0) n = 0;
+        int64_t s = end - n + 1;
+        int was_paused = L->gc_paused; L->gc_paused = 1;
+        luby_array *arr = (luby_array *)luby_gc_alloc(L, sizeof(luby_array), LUBY_GC_ARRAY);
+        if (!arr) { L->gc_paused = was_paused; return (int)LUBY_E_OOM; }
+        arr->count = (size_t)n; arr->capacity = (size_t)n; arr->frozen = 0;
+        arr->items = n > 0 ? (luby_value *)luby_alloc_raw(L, NULL, (size_t)n * sizeof(luby_value)) : NULL;
+        if (!arr->items && n > 0) { L->gc_paused = was_paused; return (int)LUBY_E_OOM; }
+        for (int64_t i = 0; i < n; i++) arr->items[i] = luby_int(s + i);
+        L->gc_paused = was_paused;
+        if (out) { out->type = LUBY_T_ARRAY; out->as.ptr = arr; }
+    } else {
+        if (out) *out = (start <= end) ? luby_int(end) : luby_nil();
+    }
+    return (int)LUBY_E_OK;
+}
+
+// (1..10).step(3) { |x| ... } or (1..10).step(2) => array
+static int luby_range_step(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (argc < 2) return (int)LUBY_E_TYPE;
+    int64_t start, end;
+    if (!luby_range_bounds(argv, &start, &end)) return (int)LUBY_E_TYPE;
+    if (argv[1].type != LUBY_T_INT || argv[1].as.i <= 0) return (int)LUBY_E_TYPE;
+    int64_t step = argv[1].as.i;
+    luby_proc *block = (L && L->current_block.type == LUBY_T_PROC) ? (luby_proc *)L->current_block.as.ptr : NULL;
+    if (block) {
+        for (int64_t i = start; i <= end; i += step) {
+            luby_value iv = luby_int(i);
+            luby_value res = luby_nil();
+            if (luby_call_block(L, block, 1, &iv, &res) != 0) return (int)LUBY_E_RUNTIME;
+        }
+        if (out) *out = argv[0];
+    } else {
+        // Return array of stepped values
+        int64_t count = (end >= start) ? ((end - start) / step + 1) : 0;
+        int was_paused = L->gc_paused; L->gc_paused = 1;
+        luby_array *arr = (luby_array *)luby_gc_alloc(L, sizeof(luby_array), LUBY_GC_ARRAY);
+        if (!arr) { L->gc_paused = was_paused; return (int)LUBY_E_OOM; }
+        arr->count = (size_t)count; arr->capacity = (size_t)count; arr->frozen = 0;
+        arr->items = count > 0 ? (luby_value *)luby_alloc_raw(L, NULL, (size_t)count * sizeof(luby_value)) : NULL;
+        if (!arr->items && count > 0) { L->gc_paused = was_paused; return (int)LUBY_E_OOM; }
+        int64_t idx = 0;
+        for (int64_t i = start; i <= end; i += step) arr->items[idx++] = luby_int(i);
+        L->gc_paused = was_paused;
+        if (out) { out->type = LUBY_T_ARRAY; out->as.ptr = arr; }
+    }
+    return (int)LUBY_E_OK;
+}
+
+// (1..5).reverse_each { |x| ... }
+static int luby_range_reverse_each(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (argc < 1) return (int)LUBY_E_TYPE;
+    int64_t start, end;
+    if (!luby_range_bounds(argv, &start, &end)) return (int)LUBY_E_TYPE;
+    luby_proc *block = (L && L->current_block.type == LUBY_T_PROC) ? (luby_proc *)L->current_block.as.ptr : NULL;
+    if (!block) { if (out) *out = argv[0]; return (int)LUBY_E_OK; }
+    for (int64_t i = end; i >= start; i--) {
+        luby_value iv = luby_int(i);
+        luby_value res = luby_nil();
+        if (luby_call_block(L, block, 1, &iv, &res) != 0) return (int)LUBY_E_RUNTIME;
+    }
+    if (out) *out = argv[0];
+    return (int)LUBY_E_OK;
+}
+
+// (1..100).sum => 5050, (1..5).sum { |x| x * x } => 55
+static int luby_range_sum(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (argc < 1) return (int)LUBY_E_TYPE;
+    int64_t start, end;
+    if (!luby_range_bounds(argv, &start, &end)) return (int)LUBY_E_TYPE;
+    luby_proc *block = (L && L->current_block.type == LUBY_T_PROC) ? (luby_proc *)L->current_block.as.ptr : NULL;
+    if (block) {
+        int64_t sum = 0;
+        for (int64_t i = start; i <= end; i++) {
+            luby_value iv = luby_int(i);
+            luby_value res = luby_nil();
+            if (luby_call_block(L, block, 1, &iv, &res) != 0) return (int)LUBY_E_RUNTIME;
+            if (res.type == LUBY_T_INT) sum += res.as.i;
+        }
+        if (out) *out = luby_int(sum);
+    } else {
+        // Arithmetic series: n*(start+end)/2
+        if (end < start) { if (out) *out = luby_int(0); return (int)LUBY_E_OK; }
+        int64_t n = end - start + 1;
+        int64_t sum = n * (start + end) / 2;
+        if (out) *out = luby_int(sum);
+    }
+    return (int)LUBY_E_OK;
+}
+
+// Range map: (1..5).map { |x| x * 2 } => [2,4,6,8,10]
+static int luby_range_map(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (argc < 1) return (int)LUBY_E_TYPE;
+    int64_t start, end;
+    if (!luby_range_bounds(argv, &start, &end)) return (int)LUBY_E_TYPE;
+    luby_proc *block = (L && L->current_block.type == LUBY_T_PROC) ? (luby_proc *)L->current_block.as.ptr : NULL;
+    if (!block) return (int)LUBY_E_TYPE;
+    int64_t count = (end >= start) ? (end - start + 1) : 0;
+    int was_paused = L->gc_paused; L->gc_paused = 1;
+    luby_array *arr = (luby_array *)luby_gc_alloc(L, sizeof(luby_array), LUBY_GC_ARRAY);
+    if (!arr) { L->gc_paused = was_paused; return (int)LUBY_E_OOM; }
+    arr->count = 0; arr->capacity = (size_t)count; arr->frozen = 0;
+    arr->items = count > 0 ? (luby_value *)luby_alloc_raw(L, NULL, (size_t)count * sizeof(luby_value)) : NULL;
+    if (!arr->items && count > 0) { L->gc_paused = was_paused; return (int)LUBY_E_OOM; }
+    L->gc_paused = was_paused;
+    for (int64_t i = start; i <= end; i++) {
+        luby_value iv = luby_int(i);
+        luby_value res = luby_nil();
+        if (luby_call_block(L, block, 1, &iv, &res) != 0) return (int)LUBY_E_RUNTIME;
+        arr->items[arr->count++] = res;
+    }
+    if (out) { out->type = LUBY_T_ARRAY; out->as.ptr = arr; }
+    return (int)LUBY_E_OK;
+}
+
+// Range select: (1..10).select { |x| x % 2 == 0 } => [2,4,6,8,10]
+static int luby_range_select(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (argc < 1) return (int)LUBY_E_TYPE;
+    int64_t start, end;
+    if (!luby_range_bounds(argv, &start, &end)) return (int)LUBY_E_TYPE;
+    luby_proc *block = (L && L->current_block.type == LUBY_T_PROC) ? (luby_proc *)L->current_block.as.ptr : NULL;
+    if (!block) return (int)LUBY_E_TYPE;
+    int64_t count = (end >= start) ? (end - start + 1) : 0;
+    int was_paused = L->gc_paused; L->gc_paused = 1;
+    luby_array *arr = (luby_array *)luby_gc_alloc(L, sizeof(luby_array), LUBY_GC_ARRAY);
+    if (!arr) { L->gc_paused = was_paused; return (int)LUBY_E_OOM; }
+    arr->count = 0; arr->capacity = (size_t)count; arr->frozen = 0;
+    arr->items = count > 0 ? (luby_value *)luby_alloc_raw(L, NULL, (size_t)count * sizeof(luby_value)) : NULL;
+    if (!arr->items && count > 0) { L->gc_paused = was_paused; return (int)LUBY_E_OOM; }
+    L->gc_paused = was_paused;
+    for (int64_t i = start; i <= end; i++) {
+        luby_value iv = luby_int(i);
+        luby_value res = luby_nil();
+        if (luby_call_block(L, block, 1, &iv, &res) != 0) return (int)LUBY_E_RUNTIME;
+        if (luby_is_truthy(res)) arr->items[arr->count++] = iv;
+    }
+    if (out) { out->type = LUBY_T_ARRAY; out->as.ptr = arr; }
+    return (int)LUBY_E_OK;
+}
+
+// Range reject: (1..10).reject { |x| x % 2 == 0 } => [1,3,5,7,9]
+static int luby_range_reject(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (argc < 1) return (int)LUBY_E_TYPE;
+    int64_t start, end;
+    if (!luby_range_bounds(argv, &start, &end)) return (int)LUBY_E_TYPE;
+    luby_proc *block = (L && L->current_block.type == LUBY_T_PROC) ? (luby_proc *)L->current_block.as.ptr : NULL;
+    if (!block) return (int)LUBY_E_TYPE;
+    int64_t count = (end >= start) ? (end - start + 1) : 0;
+    int was_paused = L->gc_paused; L->gc_paused = 1;
+    luby_array *arr = (luby_array *)luby_gc_alloc(L, sizeof(luby_array), LUBY_GC_ARRAY);
+    if (!arr) { L->gc_paused = was_paused; return (int)LUBY_E_OOM; }
+    arr->count = 0; arr->capacity = (size_t)count; arr->frozen = 0;
+    arr->items = count > 0 ? (luby_value *)luby_alloc_raw(L, NULL, (size_t)count * sizeof(luby_value)) : NULL;
+    if (!arr->items && count > 0) { L->gc_paused = was_paused; return (int)LUBY_E_OOM; }
+    L->gc_paused = was_paused;
+    for (int64_t i = start; i <= end; i++) {
+        luby_value iv = luby_int(i);
+        luby_value res = luby_nil();
+        if (luby_call_block(L, block, 1, &iv, &res) != 0) return (int)LUBY_E_RUNTIME;
+        if (!luby_is_truthy(res)) arr->items[arr->count++] = iv;
+    }
+    if (out) { out->type = LUBY_T_ARRAY; out->as.ptr = arr; }
+    return (int)LUBY_E_OK;
+}
+
+// Range any?: (1..5).any? { |x| x > 3 } => true
+static int luby_range_any(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (argc < 1) return (int)LUBY_E_TYPE;
+    int64_t start, end;
+    if (!luby_range_bounds(argv, &start, &end)) return (int)LUBY_E_TYPE;
+    luby_proc *block = (L && L->current_block.type == LUBY_T_PROC) ? (luby_proc *)L->current_block.as.ptr : NULL;
+    if (!block) { if (out) *out = luby_bool(start <= end); return (int)LUBY_E_OK; }
+    for (int64_t i = start; i <= end; i++) {
+        luby_value iv = luby_int(i);
+        luby_value res = luby_nil();
+        if (luby_call_block(L, block, 1, &iv, &res) != 0) return (int)LUBY_E_RUNTIME;
+        if (luby_is_truthy(res)) { if (out) *out = luby_bool(1); return (int)LUBY_E_OK; }
+    }
+    if (out) *out = luby_bool(0);
+    return (int)LUBY_E_OK;
+}
+
+// Range all?: (1..5).all? { |x| x > 0 } => true
+static int luby_range_all(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (argc < 1) return (int)LUBY_E_TYPE;
+    int64_t start, end;
+    if (!luby_range_bounds(argv, &start, &end)) return (int)LUBY_E_TYPE;
+    luby_proc *block = (L && L->current_block.type == LUBY_T_PROC) ? (luby_proc *)L->current_block.as.ptr : NULL;
+    if (!block) { if (out) *out = luby_bool(1); return (int)LUBY_E_OK; }
+    for (int64_t i = start; i <= end; i++) {
+        luby_value iv = luby_int(i);
+        luby_value res = luby_nil();
+        if (luby_call_block(L, block, 1, &iv, &res) != 0) return (int)LUBY_E_RUNTIME;
+        if (!luby_is_truthy(res)) { if (out) *out = luby_bool(0); return (int)LUBY_E_OK; }
+    }
+    if (out) *out = luby_bool(1);
+    return (int)LUBY_E_OK;
+}
+
+// Range none?: (1..5).none? { |x| x > 10 } => true
+static int luby_range_none(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (argc < 1) return (int)LUBY_E_TYPE;
+    int64_t start, end;
+    if (!luby_range_bounds(argv, &start, &end)) return (int)LUBY_E_TYPE;
+    luby_proc *block = (L && L->current_block.type == LUBY_T_PROC) ? (luby_proc *)L->current_block.as.ptr : NULL;
+    if (!block) { if (out) *out = luby_bool(start > end); return (int)LUBY_E_OK; }
+    for (int64_t i = start; i <= end; i++) {
+        luby_value iv = luby_int(i);
+        luby_value res = luby_nil();
+        if (luby_call_block(L, block, 1, &iv, &res) != 0) return (int)LUBY_E_RUNTIME;
+        if (luby_is_truthy(res)) { if (out) *out = luby_bool(0); return (int)LUBY_E_OK; }
+    }
+    if (out) *out = luby_bool(1);
     return (int)LUBY_E_OK;
 }
 
@@ -7702,6 +8362,212 @@ static int luby_hash_reduce(luby_state *L, int argc, const luby_value *argv, lub
         if (luby_call_block(L, block, 3, args, &acc) != 0) return (int)LUBY_E_RUNTIME;
     }
     if (out) *out = acc;
+    return (int)LUBY_E_OK;
+}
+
+// Generic map: dispatches to array or hash
+static int luby_generic_map(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (argc < 1) return (int)LUBY_E_TYPE;
+    if (argv[0].type == LUBY_T_HASH) return luby_hash_map(L, argc, argv, out);
+    if (argv[0].type == LUBY_T_RANGE) return luby_range_map(L, argc, argv, out);
+    return luby_array_map(L, argc, argv, out);
+}
+
+// Generic select: dispatches to array, hash, or range
+static int luby_generic_select(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (argc < 1) return (int)LUBY_E_TYPE;
+    if (argv[0].type == LUBY_T_HASH) return luby_hash_select(L, argc, argv, out);
+    if (argv[0].type == LUBY_T_RANGE) return luby_range_select(L, argc, argv, out);
+    return luby_array_select(L, argc, argv, out);
+}
+
+// Generic reject: dispatches to array, hash, or range
+static int luby_generic_reject(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (argc < 1) return (int)LUBY_E_TYPE;
+    if (argv[0].type == LUBY_T_HASH) return luby_hash_reject(L, argc, argv, out);
+    if (argv[0].type == LUBY_T_RANGE) return luby_range_reject(L, argc, argv, out);
+    return luby_array_reject(L, argc, argv, out);
+}
+
+// Generic any?: dispatches to array, hash, or range
+static int luby_generic_any(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (argc < 1) return (int)LUBY_E_TYPE;
+    if (argv[0].type == LUBY_T_HASH) return luby_hash_any(L, argc, argv, out);
+    if (argv[0].type == LUBY_T_RANGE) return luby_range_any(L, argc, argv, out);
+    return luby_array_any(L, argc, argv, out);
+}
+
+// Generic all?: dispatches to array, hash, or range
+static int luby_generic_all(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (argc < 1) return (int)LUBY_E_TYPE;
+    if (argv[0].type == LUBY_T_HASH) return luby_hash_all(L, argc, argv, out);
+    if (argv[0].type == LUBY_T_RANGE) return luby_range_all(L, argc, argv, out);
+    return luby_array_all(L, argc, argv, out);
+}
+
+// Generic none?: dispatches to array, hash, or range
+static int luby_generic_none(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (argc < 1) return (int)LUBY_E_TYPE;
+    if (argv[0].type == LUBY_T_HASH) return luby_hash_none(L, argc, argv, out);
+    if (argv[0].type == LUBY_T_RANGE) return luby_range_none(L, argc, argv, out);
+    return luby_array_none(L, argc, argv, out);
+}
+
+// has_key? / key?: h.has_key?(:foo)
+static int luby_hash_has_key(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    (void)L;
+    if (argc < 2 || argv[0].type != LUBY_T_HASH || !argv[0].as.ptr) return (int)LUBY_E_TYPE;
+    luby_hash *h = (luby_hash *)argv[0].as.ptr;
+    for (size_t i = 0; i < h->count; i++) {
+        if (luby_value_eq(h->entries[i].key, argv[1])) {
+            if (out) *out = luby_bool(1);
+            return (int)LUBY_E_OK;
+        }
+    }
+    if (out) *out = luby_bool(0);
+    return (int)LUBY_E_OK;
+}
+
+// has_value? / value?: h.has_value?(42)
+static int luby_hash_has_value(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    (void)L;
+    if (argc < 2 || argv[0].type != LUBY_T_HASH || !argv[0].as.ptr) return (int)LUBY_E_TYPE;
+    luby_hash *h = (luby_hash *)argv[0].as.ptr;
+    for (size_t i = 0; i < h->count; i++) {
+        if (luby_value_eq(h->entries[i].value, argv[1])) {
+            if (out) *out = luby_bool(1);
+            return (int)LUBY_E_OK;
+        }
+    }
+    if (out) *out = luby_bool(0);
+    return (int)LUBY_E_OK;
+}
+
+// fetch: h.fetch(:key) or h.fetch(:key, default)
+static int luby_hash_fetch(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (argc < 2 || argv[0].type != LUBY_T_HASH || !argv[0].as.ptr) return (int)LUBY_E_TYPE;
+    luby_value result;
+    int found = 0;
+    luby_hash_get_value_found(argv[0], argv[1], &result, &found);
+    if (found) {
+        if (out) *out = result;
+        return (int)LUBY_E_OK;
+    }
+    if (argc >= 3) {
+        if (out) *out = argv[2];
+        return (int)LUBY_E_OK;
+    }
+    luby_set_error(L, LUBY_E_RUNTIME, "key not found", NULL, 0, 0);
+    return (int)LUBY_E_RUNTIME;
+}
+
+// delete: h.delete(:key) => removed value or nil
+static int luby_hash_delete(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    (void)L;
+    if (argc < 2 || argv[0].type != LUBY_T_HASH || !argv[0].as.ptr) return (int)LUBY_E_TYPE;
+    luby_hash *h = (luby_hash *)argv[0].as.ptr;
+    for (size_t i = 0; i < h->count; i++) {
+        if (luby_value_eq(h->entries[i].key, argv[1])) {
+            luby_value removed = h->entries[i].value;
+            // Shift remaining entries
+            for (size_t j = i; j + 1 < h->count; j++) {
+                h->entries[j] = h->entries[j + 1];
+            }
+            h->count--;
+            if (out) *out = removed;
+            return (int)LUBY_E_OK;
+        }
+    }
+    if (out) *out = luby_nil();
+    return (int)LUBY_E_OK;
+}
+
+// empty?: works on arrays, hashes, and strings
+static int luby_generic_empty(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    (void)L;
+    if (argc < 1) return (int)LUBY_E_TYPE;
+    if (argv[0].type == LUBY_T_ARRAY && argv[0].as.ptr) {
+        if (out) *out = luby_bool(((luby_array *)argv[0].as.ptr)->count == 0);
+        return (int)LUBY_E_OK;
+    }
+    if (argv[0].type == LUBY_T_HASH && argv[0].as.ptr) {
+        if (out) *out = luby_bool(((luby_hash *)argv[0].as.ptr)->count == 0);
+        return (int)LUBY_E_OK;
+    }
+    if (argv[0].type == LUBY_T_STRING && argv[0].as.ptr) {
+        if (out) *out = luby_bool(strlen((const char *)argv[0].as.ptr) == 0);
+        return (int)LUBY_E_OK;
+    }
+    if (argv[0].type == LUBY_T_RANGE && argv[0].as.ptr) {
+        luby_range *r = (luby_range *)argv[0].as.ptr;
+        if (r->start.type == LUBY_T_INT && r->end.type == LUBY_T_INT) {
+            int64_t s = r->start.as.i, e = r->end.as.i;
+            if (r->exclusive) e--;
+            if (out) *out = luby_bool(s > e);
+        } else {
+            if (out) *out = luby_bool(0);
+        }
+        return (int)LUBY_E_OK;
+    }
+    return (int)LUBY_E_TYPE;
+}
+
+// Generic to_a: dispatches to range or hash
+static int luby_generic_to_a(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (argc < 1) return (int)LUBY_E_TYPE;
+    if (argv[0].type == LUBY_T_RANGE) return luby_range_to_a(L, argc, argv, out);
+    // Fall through to hash to_a
+    if (argv[0].type != LUBY_T_HASH || !argv[0].as.ptr) return (int)LUBY_E_TYPE;
+    luby_hash *h = (luby_hash *)argv[0].as.ptr;
+    int was_paused = L->gc_paused;
+    L->gc_paused = 1;
+    luby_array *arr = (luby_array *)luby_gc_alloc(L, sizeof(luby_array), LUBY_GC_ARRAY);
+    if (!arr) { L->gc_paused = was_paused; return (int)LUBY_E_OOM; }
+    arr->count = 0; arr->capacity = h->count; arr->frozen = 0;
+    arr->items = (luby_value *)luby_alloc_raw(L, NULL, arr->capacity * sizeof(luby_value));
+    if (!arr->items && arr->capacity > 0) { L->gc_paused = was_paused; return (int)LUBY_E_OOM; }
+    for (size_t i = 0; i < h->count; i++) {
+        luby_array *pair = (luby_array *)luby_gc_alloc(L, sizeof(luby_array), LUBY_GC_ARRAY);
+        if (!pair) { L->gc_paused = was_paused; return (int)LUBY_E_OOM; }
+        pair->count = 2; pair->capacity = 2; pair->frozen = 0;
+        pair->items = (luby_value *)luby_alloc_raw(L, NULL, 2 * sizeof(luby_value));
+        if (!pair->items) { L->gc_paused = was_paused; return (int)LUBY_E_OOM; }
+        pair->items[0] = h->entries[i].key;
+        pair->items[1] = h->entries[i].value;
+        arr->items[arr->count].type = LUBY_T_ARRAY;
+        arr->items[arr->count].as.ptr = pair;
+        arr->count++;
+    }
+    L->gc_paused = was_paused;
+    if (out) { out->type = LUBY_T_ARRAY; out->as.ptr = arr; }
+    return (int)LUBY_E_OK;
+}
+
+// each_key: h.each_key { |k| ... }
+static int luby_hash_each_key(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (argc < 1 || argv[0].type != LUBY_T_HASH || !argv[0].as.ptr) return (int)LUBY_E_TYPE;
+    luby_proc *block = (L && L->current_block.type == LUBY_T_PROC) ? (luby_proc *)L->current_block.as.ptr : NULL;
+    if (!block) return (int)LUBY_E_TYPE;
+    luby_hash *h = (luby_hash *)argv[0].as.ptr;
+    for (size_t i = 0; i < h->count; i++) {
+        luby_value res = luby_nil();
+        if (luby_call_block(L, block, 1, &h->entries[i].key, &res) != 0) return (int)LUBY_E_RUNTIME;
+    }
+    if (out) *out = argv[0];
+    return (int)LUBY_E_OK;
+}
+
+// each_value: h.each_value { |v| ... }
+static int luby_hash_each_value(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (argc < 1 || argv[0].type != LUBY_T_HASH || !argv[0].as.ptr) return (int)LUBY_E_TYPE;
+    luby_proc *block = (L && L->current_block.type == LUBY_T_PROC) ? (luby_proc *)L->current_block.as.ptr : NULL;
+    if (!block) return (int)LUBY_E_TYPE;
+    luby_hash *h = (luby_hash *)argv[0].as.ptr;
+    for (size_t i = 0; i < h->count; i++) {
+        luby_value res = luby_nil();
+        if (luby_call_block(L, block, 1, &h->entries[i].value, &res) != 0) return (int)LUBY_E_RUNTIME;
+    }
+    if (out) *out = argv[0];
     return (int)LUBY_E_OK;
 }
 
@@ -8260,6 +9126,37 @@ static int luby_base_protected(luby_state *L, int argc, const luby_value *argv, 
     return (int)LUBY_E_OK;
 }
 
+// module_function: makes methods both private instance methods and public singleton methods
+// When called without args, subsequent method definitions become module functions
+// When called with method names, those specific methods become module functions
+static int luby_base_module_function(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (L->current_class.type != LUBY_T_MODULE) {
+        luby_set_error(L, LUBY_E_RUNTIME, "module_function is only for modules", NULL, 0, 0);
+        return (int)LUBY_E_RUNTIME;
+    }
+    luby_class_obj *mod = (luby_class_obj *)L->current_class.as.ptr;
+    
+    if (argc == 0) {
+        // No arguments: enable module_function mode for subsequent methods
+        L->module_function_mode = 1;
+    } else {
+        // With arguments: make specific methods module functions
+        for (int i = 0; i < argc; i++) {
+            if (argv[i].type != LUBY_T_SYMBOL || !argv[i].as.ptr) continue;
+            const char *name = (const char *)argv[i].as.ptr;
+            luby_proc *proc = luby_class_get_method(L, mod, name);
+            if (proc) {
+                // Make instance method private
+                proc->visibility = LUBY_VIS_PRIVATE;
+                // Add as singleton method (public)
+                luby_class_set_singleton_method(L, mod, name, proc);
+            }
+        }
+    }
+    if (out) *out = luby_nil();
+    return (int)LUBY_E_OK;
+}
+
 // alias: creates an alias for a method
 // Usage: alias new_name old_name
 static int luby_base_alias(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
@@ -8464,16 +9361,18 @@ static int luby_array_reverse(luby_state *L, int argc, const luby_value *argv, l
 }
 
 static int luby_array_first(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
-    (void)L;
-    if (argc < 1 || argv[0].type != LUBY_T_ARRAY || !argv[0].as.ptr) return (int)LUBY_E_TYPE;
+    if (argc < 1) return (int)LUBY_E_TYPE;
+    if (argv[0].type == LUBY_T_RANGE) return luby_range_first(L, argc, argv, out);
+    if (argv[0].type != LUBY_T_ARRAY || !argv[0].as.ptr) return (int)LUBY_E_TYPE;
     luby_array *arr = (luby_array *)argv[0].as.ptr;
     if (out) *out = (arr->count > 0) ? arr->items[0] : luby_nil();
     return (int)LUBY_E_OK;
 }
 
 static int luby_array_last(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
-    (void)L;
-    if (argc < 1 || argv[0].type != LUBY_T_ARRAY || !argv[0].as.ptr) return (int)LUBY_E_TYPE;
+    if (argc < 1) return (int)LUBY_E_TYPE;
+    if (argv[0].type == LUBY_T_RANGE) return luby_range_last(L, argc, argv, out);
+    if (argv[0].type != LUBY_T_ARRAY || !argv[0].as.ptr) return (int)LUBY_E_TYPE;
     luby_array *arr = (luby_array *)argv[0].as.ptr;
     if (out) *out = (arr->count > 0) ? arr->items[arr->count - 1] : luby_nil();
     return (int)LUBY_E_OK;
@@ -8735,7 +9634,9 @@ static int luby_array_flat_map(luby_state *L, int argc, const luby_value *argv, 
 
 // sum: [arr].sum or [arr].sum { |x| expr }
 static int luby_array_sum(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
-    if (argc < 1 || argv[0].type != LUBY_T_ARRAY || !argv[0].as.ptr) return (int)LUBY_E_TYPE;
+    if (argc < 1) return (int)LUBY_E_TYPE;
+    if (argv[0].type == LUBY_T_RANGE) return luby_range_sum(L, argc, argv, out);
+    if (argv[0].type != LUBY_T_ARRAY || !argv[0].as.ptr) return (int)LUBY_E_TYPE;
     luby_proc *block = (L && L->current_block.type == LUBY_T_PROC) ? (luby_proc *)L->current_block.as.ptr : NULL;
     luby_array *src = (luby_array *)argv[0].as.ptr;
 
@@ -8765,7 +9666,9 @@ static int luby_array_sum(luby_state *L, int argc, const luby_value *argv, luby_
 
 // count: [arr].count or [arr].count { |x| predicate }
 static int luby_array_count(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
-    if (argc < 1 || argv[0].type != LUBY_T_ARRAY || !argv[0].as.ptr) return (int)LUBY_E_TYPE;
+    if (argc < 1) return (int)LUBY_E_TYPE;
+    if (argv[0].type == LUBY_T_RANGE) return luby_range_size(L, argc, argv, out);
+    if (argv[0].type != LUBY_T_ARRAY || !argv[0].as.ptr) return (int)LUBY_E_TYPE;
     luby_proc *block = (L && L->current_block.type == LUBY_T_PROC) ? (luby_proc *)L->current_block.as.ptr : NULL;
     luby_array *src = (luby_array *)argv[0].as.ptr;
 
@@ -9542,6 +10445,7 @@ static int luby_math_sign(luby_state *L, int argc, const luby_value *argv, luby_
 }
 
 static int luby_math_min(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (argc == 1 && argv[0].type == LUBY_T_RANGE) return luby_range_min(L, argc, argv, out);
     (void)L;
     if (argc < 1) return (int)LUBY_E_TYPE;
     double result = luby_to_double(argv[0]);
@@ -9560,6 +10464,7 @@ static int luby_math_min(luby_state *L, int argc, const luby_value *argv, luby_v
 }
 
 static int luby_math_max(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (argc == 1 && argv[0].type == LUBY_T_RANGE) return luby_range_max(L, argc, argv, out);
     (void)L;
     if (argc < 1) return (int)LUBY_E_TYPE;
     double result = luby_to_double(argv[0]);
@@ -10181,6 +11086,8 @@ static int luby_base_includes(luby_state *L, int argc, const luby_value *argv, l
             if (luby_value_eq(arr->items[i], argv[1])) { found = 1; break; }
         }
         if (out) *out = luby_bool(found);
+    } else if (argv[0].type == LUBY_T_RANGE) {
+        return luby_range_include(L, argc, argv, out);
     } else return (int)LUBY_E_TYPE;
     return (int)LUBY_E_OK;
 }
@@ -10325,6 +11232,7 @@ LUBY_API void luby_open_base(luby_state *L) {
     luby_register_function(L, "private", luby_base_private);
     luby_register_function(L, "public", luby_base_public);
     luby_register_function(L, "protected", luby_base_protected);
+    luby_register_function(L, "module_function", luby_base_module_function);
     luby_register_function(L, "alias", luby_base_alias);
     luby_register_function(L, "array_push", luby_array_push);
     luby_register_function(L, "array_pop", luby_array_pop);
@@ -10340,9 +11248,9 @@ LUBY_API void luby_open_base(luby_state *L) {
     luby_register_function(L, "array_all", luby_array_all);
     luby_register_function(L, "array_none", luby_array_none);
     luby_register_function(L, "array_find", luby_array_find);
-    luby_register_function(L, "map", luby_array_map);
-    luby_register_function(L, "select", luby_array_select);
-    luby_register_function(L, "reject", luby_array_reject);
+    luby_register_function(L, "map", luby_generic_map);
+    luby_register_function(L, "select", luby_generic_select);
+    luby_register_function(L, "reject", luby_generic_reject);
     luby_register_function(L, "each", luby_generic_each);
     luby_register_function(L, "each_with_index", luby_array_each_with_index);
     luby_register_function(L, "range_each", luby_range_each);
@@ -10350,9 +11258,9 @@ LUBY_API void luby_open_base(luby_state *L) {
     luby_register_function(L, "compact!", luby_array_compact_bang);
     luby_register_function(L, "reduce", luby_array_reduce);
     luby_register_function(L, "inject", luby_array_reduce);
-    luby_register_function(L, "any?", luby_array_any);
-    luby_register_function(L, "all?", luby_array_all);
-    luby_register_function(L, "none?", luby_array_none);
+    luby_register_function(L, "any?", luby_generic_any);
+    luby_register_function(L, "all?", luby_generic_all);
+    luby_register_function(L, "none?", luby_generic_none);
     luby_register_function(L, "find", luby_array_find);
     luby_register_function(L, "hash_get", luby_hash_get);
     luby_register_function(L, "hash_set", luby_hash_set);
@@ -10377,6 +11285,22 @@ LUBY_API void luby_open_base(luby_state *L) {
     luby_register_function(L, "none_hash", luby_hash_none);
     luby_register_function(L, "find_hash", luby_hash_find);
     luby_register_function(L, "reduce_hash", luby_hash_reduce);
+    luby_register_function(L, "has_key?", luby_hash_has_key);
+    luby_register_function(L, "key?", luby_hash_has_key);
+    luby_register_function(L, "has_value?", luby_hash_has_value);
+    luby_register_function(L, "value?", luby_hash_has_value);
+    luby_register_function(L, "fetch", luby_hash_fetch);
+    luby_register_function(L, "delete", luby_hash_delete);
+    luby_register_function(L, "empty?", luby_generic_empty);
+    luby_register_function(L, "to_a", luby_generic_to_a);
+    luby_register_function(L, "each_key", luby_hash_each_key);
+    luby_register_function(L, "each_value", luby_hash_each_value);
+    // Range methods
+    luby_register_function(L, "step", luby_range_step);
+    luby_register_function(L, "reverse_each", luby_range_reverse_each);
+    luby_register_function(L, "size", luby_base_len);
+    luby_register_function(L, "length", luby_base_len);
+    luby_register_function(L, "member?", luby_base_includes);
     // Additional stdlib functions
     luby_register_function(L, "to_s", luby_base_to_s);
     luby_register_function(L, "is_nil", luby_base_is_nil);
