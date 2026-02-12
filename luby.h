@@ -273,6 +273,7 @@ typedef enum luby_ast_kind {
     LUBY_AST_DEFAULT_PARAM,   // x = default_value
     LUBY_AST_SPLAT_PARAM,     // *args
     LUBY_AST_BLOCK_PARAM,     // &block
+    LUBY_AST_KWARG_PARAM,     // name: or name: default_value
     LUBY_AST_BEGIN,
     LUBY_AST_ASSIGN,
     LUBY_AST_MULTI_ASSIGN,    // a, b = 1, 2
@@ -447,6 +448,9 @@ typedef struct luby_vm_frame {
     int *local_existed;
     luby_value *local_saved;
     size_t local_count;
+    int *kwarg_existed;
+    luby_value *kwarg_saved;
+    size_t kwarg_count;
     // For new/initialize: return this value instead of method's return value
     luby_value return_override;
     int has_return_override;
@@ -740,6 +744,9 @@ struct luby_proc {
     luby_chunk chunk;
     int owned_by_chunk;
     luby_visibility visibility;   // method visibility
+    char **kwarg_names;           // names of keyword params
+    size_t kwarg_count;           // number of keyword params
+    luby_chunk *kwarg_default_chunks; // bytecode for kwarg defaults (empty chunk = required)
 };
 
 struct luby_coroutine {
@@ -888,6 +895,14 @@ static void luby_gc_mark_obj(luby_gc_obj *obj) {
                 for (size_t i = 0; i < proc->param_count; i++) {
                     for (size_t j = 0; j < proc->default_chunks[i].const_count; j++) {
                         luby_gc_mark_value(proc->default_chunks[i].consts[j]);
+                    }
+                }
+            }
+            // Mark kwarg default value chunks
+            if (proc->kwarg_default_chunks) {
+                for (size_t i = 0; i < proc->kwarg_count; i++) {
+                    for (size_t j = 0; j < proc->kwarg_default_chunks[i].const_count; j++) {
+                        luby_gc_mark_value(proc->kwarg_default_chunks[i].consts[j]);
                     }
                 }
             }
@@ -2136,6 +2151,7 @@ static luby_ast_node *luby_dup_ast(luby_state *L, luby_ast_node *node) {
         case LUBY_AST_ASSIGN:
         case LUBY_AST_IVAR_ASSIGN:
         case LUBY_AST_DEFAULT_PARAM:
+        case LUBY_AST_KWARG_PARAM:
             copy->as.assign.target = luby_dup_ast(L, node->as.assign.target);
             copy->as.assign.value = luby_dup_ast(L, node->as.assign.value);
             break;
@@ -2282,6 +2298,7 @@ static void luby_free_ast(luby_state *L, luby_ast_node *node) {
             luby_free_ast(L, node->as.assign.value);
             break;
         case LUBY_AST_DEFAULT_PARAM:
+        case LUBY_AST_KWARG_PARAM:
             luby_free_ast(L, node->as.assign.target);
             luby_free_ast(L, node->as.assign.value);
             break;
@@ -3042,14 +3059,49 @@ static luby_ast_node *luby_parse_keyword_call(luby_state *L, luby_parser *p, con
 }
 
 static void luby_parse_call_args(luby_state *L, luby_parser *p, luby_ast_node *call) {
+    luby_ast_node *kwargs_hash = NULL;
     while (p->current.kind != LUBY_TOK_RPAREN && p->current.kind != LUBY_TOK_EOF) {
-        luby_ast_node *arg = luby_parse_expr(L, p, 0);
+        // Check for keyword argument: identifier followed by colon
+        if (p->current.kind == LUBY_TOK_IDENTIFIER && p->next.kind == LUBY_TOK_COLON) {
+            // Create kwargs hash on first kwarg
+            if (!kwargs_hash) {
+                kwargs_hash = luby_new_node(L, LUBY_AST_HASH, p->current.line, p->current.column);
+                if (!kwargs_hash) return;
+            }
+            // Parse key: value pair
+            luby_token keytok = p->current;
+            luby_ast_node *key = luby_new_node(L, LUBY_AST_SYMBOL, keytok.line, keytok.column);
+            if (!key) return;
+            key->as.literal = keytok.lexeme;
+            luby_parser_advance(p); // consume identifier
+            luby_parser_advance(p); // consume colon
+            luby_ast_node *value = luby_parse_expr(L, p, 0);
+            luby_ast_node *pair = luby_new_node(L, LUBY_AST_PAIR, keytok.line, keytok.column);
+            if (!pair) return;
+            pair->as.pair.left = key;
+            pair->as.pair.right = value;
+            size_t hn = kwargs_hash->as.list.count;
+            kwargs_hash->as.list.items = (luby_ast_node **)luby_alloc_raw(L, kwargs_hash->as.list.items, (hn + 1) * sizeof(luby_ast_node *));
+            if (!kwargs_hash->as.list.items) return;
+            kwargs_hash->as.list.items[hn] = pair;
+            kwargs_hash->as.list.count = hn + 1;
+        } else {
+            luby_ast_node *arg = luby_parse_expr(L, p, 0);
+            size_t n = call->as.call.argc;
+            call->as.call.args = (luby_ast_node **)luby_alloc_raw(L, call->as.call.args, (n + 1) * sizeof(luby_ast_node *));
+            if (!call->as.call.args) return;
+            call->as.call.args[n] = arg;
+            call->as.call.argc = n + 1;
+        }
+        if (!luby_parser_match(p, LUBY_TOK_COMMA)) break;
+    }
+    // Append kwargs hash as last argument if any keyword args were found
+    if (kwargs_hash) {
         size_t n = call->as.call.argc;
         call->as.call.args = (luby_ast_node **)luby_alloc_raw(L, call->as.call.args, (n + 1) * sizeof(luby_ast_node *));
         if (!call->as.call.args) return;
-        call->as.call.args[n] = arg;
+        call->as.call.args[n] = kwargs_hash;
         call->as.call.argc = n + 1;
-        if (!luby_parser_match(p, LUBY_TOK_COMMA)) break;
     }
 }
 
@@ -3124,12 +3176,26 @@ static luby_ast_node *luby_parse_params(luby_state *L, luby_parser *p) {
             param = luby_new_node(L, LUBY_AST_BLOCK_PARAM, name.line, name.column);
             if (param) param->as.literal = name.lexeme;
         }
-        // Regular param or default param
+        // Regular param, default param, or keyword param
         else if (p->current.kind == LUBY_TOK_IDENTIFIER) {
             luby_token name = p->current;
             luby_parser_advance(p);
+            // Check for keyword param: name: or name: default_value
+            if (luby_parser_match(p, LUBY_TOK_COLON)) {
+                param = luby_new_node(L, LUBY_AST_KWARG_PARAM, name.line, name.column);
+                if (param) {
+                    param->as.assign.target = luby_new_node(L, LUBY_AST_IDENT, name.line, name.column);
+                    if (param->as.assign.target) param->as.assign.target->as.literal = name.lexeme;
+                    // Check if there's a default value (next token is not comma or rparen)
+                    if (p->current.kind != LUBY_TOK_COMMA && p->current.kind != LUBY_TOK_RPAREN && p->current.kind != LUBY_TOK_EOF) {
+                        param->as.assign.value = luby_parse_expr(L, p, 0);
+                    } else {
+                        param->as.assign.value = NULL; // required kwarg
+                    }
+                }
+            }
             // Check for default value: x = expr
-            if (luby_parser_match(p, LUBY_TOK_EQ)) {
+            else if (luby_parser_match(p, LUBY_TOK_EQ)) {
                 luby_ast_node *default_val = luby_parse_expr(L, p, 0);
                 param = luby_new_node(L, LUBY_AST_DEFAULT_PARAM, name.line, name.column);
                 if (param) {
@@ -3951,6 +4017,18 @@ static void luby_proc_free(luby_state *L, luby_proc *proc) {
         }
         luby_alloc_raw(L, proc->default_chunks, 0);
     }
+    if (proc->kwarg_names) {
+        for (size_t i = 0; i < proc->kwarg_count; i++) {
+            luby_alloc_raw(L, proc->kwarg_names[i], 0);
+        }
+        luby_alloc_raw(L, proc->kwarg_names, 0);
+    }
+    if (proc->kwarg_default_chunks) {
+        for (size_t i = 0; i < proc->kwarg_count; i++) {
+            luby_chunk_free(L, &proc->kwarg_default_chunks[i]);
+        }
+        luby_alloc_raw(L, proc->kwarg_default_chunks, 0);
+    }
     luby_chunk_free(L, &proc->chunk);
     // Note: the proc struct itself is freed by the GC sweep, not here.
 }
@@ -4072,12 +4150,10 @@ static void luby_vm_free(luby_state *L, luby_vm *vm) {
     if (!vm) return;
     for (int i = vm->frame_count - 1; i >= 0; i--) {
         luby_vm_frame *f = &vm->frames[i];
-        if (f->param_existed) {
-            luby_alloc_raw(L, f->param_existed, 0);
-        }
-        if (f->param_saved) {
-            luby_alloc_raw(L, f->param_saved, 0);
-        }
+        if (f->param_existed) luby_alloc_raw(L, f->param_existed, 0);
+        if (f->param_saved) luby_alloc_raw(L, f->param_saved, 0);
+        if (f->kwarg_existed) luby_alloc_raw(L, f->kwarg_existed, 0);
+        if (f->kwarg_saved) luby_alloc_raw(L, f->kwarg_saved, 0);
     }
     luby_alloc_raw(L, vm->frames, 0);
     luby_alloc_raw(L, vm->stack, 0);
@@ -4146,6 +4222,12 @@ static int luby_vm_push_frame(luby_state *L, luby_vm *vm, luby_proc *proc, luby_
     L->current_method_name = method_name;
     L->current_block = block;
 
+    // If the method expects kwargs and the last arg is a hash, exclude it from positional argc
+    int pos_argc = argc;
+    if (proc && proc->kwarg_count > 0 && argc > 0 && argv[argc - 1].type == LUBY_T_HASH) {
+        pos_argc = argc - 1;
+    }
+
     f->param_count = (proc && proc->param_count > 0) ? proc->param_count : 0;
     if (f->param_count > 0) {
         f->param_existed = (int *)luby_alloc_raw(L, NULL, f->param_count * sizeof(int));
@@ -4171,7 +4253,7 @@ static int luby_vm_push_frame(luby_state *L, luby_vm *vm, luby_proc *proc, luby_
                 // Collect remaining args into array for splat param
                 luby_array *arr = (luby_array *)luby_gc_alloc(L, sizeof(luby_array), LUBY_GC_ARRAY);
                 if (arr) {
-                    size_t splat_count = ((size_t)argc > regular_count) ? (size_t)argc - regular_count : 0;
+                    size_t splat_count = ((size_t)pos_argc > regular_count) ? (size_t)pos_argc - regular_count : 0;
                     arr->count = splat_count;
                     arr->capacity = splat_count > 0 ? splat_count : 1;
                     arr->frozen = 0;
@@ -4182,7 +4264,7 @@ static int luby_vm_push_frame(luby_state *L, luby_vm *vm, luby_proc *proc, luby_
                     v.type = LUBY_T_ARRAY;
                     v.as.ptr = arr;
                 }
-            } else if (i < (size_t)argc) {
+            } else if (i < (size_t)pos_argc) {
                 v = argv[i];
             } else if (proc->default_chunks && proc->default_chunks[i].count > 0) {
                 // Evaluate default value
@@ -4198,6 +4280,61 @@ static int luby_vm_push_frame(luby_state *L, luby_vm *vm, luby_proc *proc, luby_
     if (proc && proc->has_block_param && proc->block_param_name) {
         luby_string_view name = { proc->block_param_name, strlen(proc->block_param_name) };
         luby_set_global(L, name, block);
+    }
+
+    // Handle keyword arguments
+    f->kwarg_existed = NULL;
+    f->kwarg_saved = NULL;
+    f->kwarg_count = 0;
+    if (proc && proc->kwarg_count > 0) {
+        f->kwarg_count = proc->kwarg_count;
+        f->kwarg_existed = (int *)luby_alloc_raw(L, NULL, f->kwarg_count * sizeof(int));
+        f->kwarg_saved = (luby_value *)luby_alloc_raw(L, NULL, f->kwarg_count * sizeof(luby_value));
+        if (!f->kwarg_existed || !f->kwarg_saved) {
+            luby_alloc_raw(L, f->kwarg_existed, 0);
+            luby_alloc_raw(L, f->kwarg_saved, 0);
+            f->kwarg_count = 0;
+        } else {
+            // The kwargs hash should be the last positional argument
+            luby_hash *kw_hash = NULL;
+            if (argc > 0 && argv[argc - 1].type == LUBY_T_HASH) {
+                kw_hash = (luby_hash *)argv[argc - 1].as.ptr;
+            }
+            for (size_t i = 0; i < f->kwarg_count; i++) {
+                luby_string_view kname = { proc->kwarg_names[i], proc->kwarg_names[i] ? strlen(proc->kwarg_names[i]) : 0 };
+                int idx = luby_find_global(L, kname);
+                f->kwarg_existed[i] = idx;
+                if (idx >= 0) f->kwarg_saved[i] = L->global_values[idx];
+
+                luby_value v = luby_nil();
+                int found = 0;
+                if (kw_hash) {
+                    // Look up the symbol key in the kwargs hash
+                    luby_value sym_key = luby_symbol(L, proc->kwarg_names[i], kname.length);
+                    for (size_t j = 0; j < kw_hash->count; j++) {
+                        if (kw_hash->entries[j].key.type == LUBY_T_SYMBOL &&
+                            strcmp((const char *)kw_hash->entries[j].key.as.ptr, (const char *)sym_key.as.ptr) == 0) {
+                            v = kw_hash->entries[j].value;
+                            found = 1;
+                            break;
+                        }
+                    }
+                }
+                if (!found) {
+                    // Try default value
+                    if (proc->kwarg_default_chunks && proc->kwarg_default_chunks[i].count > 0) {
+                        luby_value def_val = luby_nil();
+                        luby_execute_chunk(L, &proc->kwarg_default_chunks[i], &def_val, "<kwdefault>");
+                        v = def_val;
+                    } else {
+                        // Required kwarg missing - set error
+                        luby_set_error(L, LUBY_E_RUNTIME, "missing keyword argument", filename, 0, 0);
+                        // Still set nil so we don't crash
+                    }
+                }
+                luby_set_global(L, kname, v);
+            }
+        }
     }
 
     // Save/clear local variables so they don't leak into the callee's scope
@@ -4245,6 +4382,18 @@ static void luby_vm_pop_frame(luby_state *L, luby_vm *vm, luby_value ret, int pu
         luby_remove_global(L, name);
     }
 
+    // Restore keyword arguments
+    if (f->proc && f->kwarg_count > 0 && f->kwarg_existed && f->kwarg_saved) {
+        for (size_t i = 0; i < f->kwarg_count; i++) {
+            luby_string_view name = { f->proc->kwarg_names[i], f->proc->kwarg_names[i] ? strlen(f->proc->kwarg_names[i]) : 0 };
+            if (f->kwarg_existed[i] >= 0) {
+                luby_set_global(L, name, f->kwarg_saved[i]);
+            } else {
+                luby_remove_global(L, name);
+            }
+        }
+    }
+
     // Restore local variables
     if (f->proc && f->local_count > 0 && f->local_existed && f->local_saved) {
         for (size_t i = 0; i < f->local_count; i++) {
@@ -4263,6 +4412,11 @@ static void luby_vm_pop_frame(luby_state *L, luby_vm *vm, luby_value ret, int pu
     f->param_existed = NULL;
     f->param_saved = NULL;
     f->param_count = 0;
+    if (f->kwarg_existed) luby_alloc_raw(L, f->kwarg_existed, 0);
+    if (f->kwarg_saved) luby_alloc_raw(L, f->kwarg_saved, 0);
+    f->kwarg_existed = NULL;
+    f->kwarg_saved = NULL;
+    f->kwarg_count = 0;
     if (f->local_existed) luby_alloc_raw(L, f->local_existed, 0);
     if (f->local_saved) luby_alloc_raw(L, f->local_saved, 0);
     f->local_existed = NULL;
@@ -5491,35 +5645,68 @@ static luby_proc *luby_compile_def_proc(luby_compiler *C, luby_ast_node *defn) {
     if (!proc) return NULL;
     proc->owned_by_chunk = 0;
     proc->splat_index = -1;
+    proc->kwarg_names = NULL;
+    proc->kwarg_count = 0;
+    proc->kwarg_default_chunks = NULL;
 
     if (defn->as.defn.param_count > 0) {
+        // Count kwargs vs regular params
+        size_t kwarg_count = 0;
+        for (size_t i = 0; i < defn->as.defn.param_count; i++) {
+            if (defn->as.defn.params[i]->kind == LUBY_AST_KWARG_PARAM) kwarg_count++;
+        }
+        size_t regular_count = defn->as.defn.param_count - kwarg_count;
+
         proc->param_names = (char **)luby_alloc_raw(C->L, NULL, defn->as.defn.param_count * sizeof(char *));
         proc->default_chunks = (luby_chunk *)luby_alloc_raw(C->L, NULL, defn->as.defn.param_count * sizeof(luby_chunk));
         if (!proc->param_names || !proc->default_chunks) return NULL;
-        proc->param_count = defn->as.defn.param_count;
-        
-        for (size_t i = 0; i < proc->param_count; i++) {
+        proc->param_count = regular_count;
+
+        if (kwarg_count > 0) {
+            proc->kwarg_names = (char **)luby_alloc_raw(C->L, NULL, kwarg_count * sizeof(char *));
+            proc->kwarg_default_chunks = (luby_chunk *)luby_alloc_raw(C->L, NULL, kwarg_count * sizeof(luby_chunk));
+            if (!proc->kwarg_names || !proc->kwarg_default_chunks) return NULL;
+            proc->kwarg_count = kwarg_count;
+        }
+
+        size_t pi = 0; // positional param index
+        size_t ki = 0; // kwarg index
+        for (size_t i = 0; i < defn->as.defn.param_count; i++) {
             luby_ast_node *param = defn->as.defn.params[i];
-            luby_chunk_init(&proc->default_chunks[i]);
-            
-            if (param->kind == LUBY_AST_DEFAULT_PARAM) {
-                proc->param_names[i] = luby_dup_string(C->L, param->as.assign.target->as.literal.data, param->as.assign.target->as.literal.length);
-                // Compile default value into its own chunk
-                luby_compiler dsub;
-                dsub.L = C->L;
-                dsub.chunk = &proc->default_chunks[i];
-                dsub.class_depth = 0;
-                dsub.loop_depth = 0;
-                luby_compile_node(&dsub, param->as.assign.value);
-            } else if (param->kind == LUBY_AST_SPLAT_PARAM) {
-                proc->param_names[i] = luby_dup_string(C->L, param->as.literal.data, param->as.literal.length);
-                proc->splat_index = (int)i;
-            } else if (param->kind == LUBY_AST_BLOCK_PARAM) {
-                proc->block_param_name = luby_dup_string(C->L, param->as.literal.data, param->as.literal.length);
-                proc->has_block_param = 1;
-                proc->param_count--; // Don't count block param in regular params
+
+            if (param->kind == LUBY_AST_KWARG_PARAM) {
+                proc->kwarg_names[ki] = luby_dup_string(C->L, param->as.assign.target->as.literal.data, param->as.assign.target->as.literal.length);
+                luby_chunk_init(&proc->kwarg_default_chunks[ki]);
+                if (param->as.assign.value) {
+                    luby_compiler dsub;
+                    dsub.L = C->L;
+                    dsub.chunk = &proc->kwarg_default_chunks[ki];
+                    dsub.class_depth = 0;
+                    dsub.loop_depth = 0;
+                    luby_compile_node(&dsub, param->as.assign.value);
+                }
+                ki++;
             } else {
-                proc->param_names[i] = luby_dup_string(C->L, param->as.literal.data, param->as.literal.length);
+                luby_chunk_init(&proc->default_chunks[pi]);
+                if (param->kind == LUBY_AST_DEFAULT_PARAM) {
+                    proc->param_names[pi] = luby_dup_string(C->L, param->as.assign.target->as.literal.data, param->as.assign.target->as.literal.length);
+                    luby_compiler dsub;
+                    dsub.L = C->L;
+                    dsub.chunk = &proc->default_chunks[pi];
+                    dsub.class_depth = 0;
+                    dsub.loop_depth = 0;
+                    luby_compile_node(&dsub, param->as.assign.value);
+                } else if (param->kind == LUBY_AST_SPLAT_PARAM) {
+                    proc->param_names[pi] = luby_dup_string(C->L, param->as.literal.data, param->as.literal.length);
+                    proc->splat_index = (int)pi;
+                } else if (param->kind == LUBY_AST_BLOCK_PARAM) {
+                    proc->block_param_name = luby_dup_string(C->L, param->as.literal.data, param->as.literal.length);
+                    proc->has_block_param = 1;
+                    proc->param_count--;
+                } else {
+                    proc->param_names[pi] = luby_dup_string(C->L, param->as.literal.data, param->as.literal.length);
+                }
+                pi++;
             }
         }
     }
@@ -5532,16 +5719,27 @@ static luby_proc *luby_compile_def_proc(luby_compiler *C, luby_ast_node *defn) {
     sub.loop_depth = 0;
     if (!luby_compile_node(&sub, defn->as.defn.body)) return NULL;
     
-    // Collect local variable names from function body (excluding params)
+    // Collect local variable names from function body (excluding params and kwargs)
     proc->local_names = NULL;
     proc->local_count = 0;
+    // Build combined param list: positional params + kwarg names
+    size_t all_param_count = proc->param_count + proc->kwarg_count;
+    char **all_param_names = NULL;
+    if (all_param_count > 0) {
+        all_param_names = (char **)luby_alloc_raw(C->L, NULL, all_param_count * sizeof(char *));
+        for (size_t i = 0; i < proc->param_count; i++)
+            all_param_names[i] = proc->param_names[i];
+        for (size_t i = 0; i < proc->kwarg_count; i++)
+            all_param_names[proc->param_count + i] = proc->kwarg_names[i];
+    }
     luby_collect_locals(C->L, defn->as.defn.body,
                         &proc->local_names, &proc->local_count,
-                        proc->param_names, proc->param_count);
+                        all_param_names, all_param_count);
+    if (all_param_names) luby_alloc_raw(C->L, all_param_names, 0);
 
     // Set visibility from current state
     proc->visibility = C->L->current_visibility;
-    
+
     return proc;
 }
 
