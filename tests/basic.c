@@ -944,6 +944,68 @@ int main(void) {
         }
     }
 
+    // GC stress test: allocate many strings in a loop to trigger collection
+    {
+        const char *gc_stress =
+            "result = \"\"\n"
+            "i = 0\n"
+            "while i < 500\n"
+            "  result = result + \"x\"\n"
+            "  i = i + 1\n"
+            "end\n"
+            "len(result)\n";
+        luby_value gc_out;
+        if (eval_check(L, "gc_stress_strings", gc_stress, &gc_out)) {
+            ok &= assert_int("gc_stress_strings", gc_out, 500);
+        } else {
+            ok = 0;
+        }
+    }
+
+    // GC stress test: arrays
+    {
+        const char *gc_array =
+            "arr = []\n"
+            "i = 0\n"
+            "while i < 300\n"
+            "  arr = arr + [i]\n"
+            "  i = i + 1\n"
+            "end\n"
+            "len(arr)\n";
+        luby_value gc_out;
+        if (eval_check(L, "gc_stress_arrays", gc_array, &gc_out)) {
+            ok &= assert_int("gc_stress_arrays", gc_out, 300);
+        } else {
+            ok = 0;
+        }
+    }
+
+    // GC stress test: object creation
+    {
+        const char *gc_objects =
+            "class GCTestObj\n"
+            "  def initialize(v)\n"
+            "    @value = v\n"
+            "  end\n"
+            "  def value\n"
+            "    @value\n"
+            "  end\n"
+            "end\n"
+            "objs = []\n"
+            "i = 0\n"
+            "while i < 200\n"
+            "  objs = objs + [GCTestObj.new(i)]\n"
+            "  i = i + 1\n"
+            "end\n"
+            "objs[199].value\n";
+        luby_value gc_out;
+        if (eval_check(L, "gc_stress_objects", gc_objects, &gc_out)) {
+            ok &= assert_int("gc_stress_objects", gc_out, 199);
+        } else {
+            ok = 0;
+        }
+    }
+
     luby_free(L);
     return ok ? 0 : 1;
 }

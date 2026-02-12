@@ -1,7 +1,6 @@
 # Luby TODO
 
 ## In Progress
-- [ ] Garbage collector (mark-and-sweep or refcounting)
 
 ## Planned
 - [ ] Regex support
@@ -16,6 +15,7 @@
 - [ ] Fiber support
 
 ## Done
+- [x] Garbage collector (mark-and-sweep with intrusive linked list)
 - [x] Lexer and parser
 - [x] Bytecode compiler and VM
 - [x] Core types (Integer, Float, String, Symbol, Array, Hash, Proc)
@@ -32,3 +32,4 @@
 - [x] Userdata with finalizers
 - [x] Native function and module registration
 - [x] File/line error reporting
+- [x] `initialize` method called by `new` (bugfix)

@@ -35,6 +35,7 @@ typedef struct luby_proc luby_proc;
 typedef struct luby_class luby_class;
 typedef struct luby_module luby_module;
 typedef struct luby_class_obj luby_class_obj;
+typedef struct luby_gc_obj luby_gc_obj;
 
 // ------------------------------ Value Model --------------------------------
 
@@ -446,6 +447,9 @@ typedef struct luby_vm_frame {
     int *local_existed;
     luby_value *local_saved;
     size_t local_count;
+    // For new/initialize: return this value instead of method's return value
+    luby_value return_override;
+    int has_return_override;
 } luby_vm_frame;
 
 typedef struct luby_vm {
@@ -623,9 +627,50 @@ struct luby_state {
     size_t symbol_count;
     size_t symbol_capacity;
     uint64_t rng_state[2];  // xoroshiro128+ state for seeded RNG
+
+    // Garbage collector
+    luby_gc_obj *gc_objects;       // intrusive linked list of all GC objects
+    size_t gc_alloc_count;         // number of GC objects allocated since last collection
+    size_t gc_threshold;           // trigger collection when gc_alloc_count reaches this
+    size_t gc_total;               // total number of live GC objects
+    int gc_paused;                 // if non-zero, GC collection is inhibited
 };
 
+// ----------------------------- GC Header ----------------------------------
+
+typedef enum luby_gc_type {
+    LUBY_GC_STRING,
+    LUBY_GC_ARRAY,
+    LUBY_GC_HASH,
+    LUBY_GC_CLASS,
+    LUBY_GC_OBJECT,
+    LUBY_GC_PROC,
+    LUBY_GC_RANGE,
+    LUBY_GC_COROUTINE,
+    LUBY_GC_CMETHOD
+} luby_gc_type;
+
+struct luby_gc_obj {
+    struct luby_gc_obj *gc_next;
+    luby_gc_type gc_type;
+    int gc_marked;
+};
+
+// String objects: GC header + char data (flexible array member)
+// The luby_value.as.ptr for LUBY_T_STRING points to the data[] field,
+// so existing code using (const char *)v.as.ptr works unchanged.
+// Use LUBY_STRING_OBJ(ptr) to recover the header from a data pointer.
+typedef struct luby_string_obj {
+    luby_gc_obj gc;
+    size_t length;
+    char data[];   // flexible array member — string chars follow the header
+} luby_string_obj;
+
+#define LUBY_STRING_OBJ(cstr) \
+    ((luby_string_obj *)((char *)(cstr) - offsetof(luby_string_obj, data)))
+
 typedef struct luby_array {
+    luby_gc_obj gc;
     size_t count;
     size_t capacity;
     luby_value *items;
@@ -638,6 +683,7 @@ typedef struct luby_hash_entry {
 } luby_hash_entry;
 
 typedef struct luby_hash {
+    luby_gc_obj gc;
     size_t count;
     size_t capacity;
     luby_hash_entry *entries;
@@ -645,6 +691,7 @@ typedef struct luby_hash {
 } luby_hash;
 
 struct luby_class_obj {
+    luby_gc_obj gc;
     char *name;
     struct luby_class_obj *super;
     luby_hash *methods;
@@ -663,6 +710,7 @@ struct luby_class_obj {
 };
 
 typedef struct luby_object {
+    luby_gc_obj gc;
     luby_class_obj *klass;
     luby_hash *ivars;
     luby_hash *singleton_methods;
@@ -673,12 +721,14 @@ typedef struct luby_object {
 } luby_object;
 
 typedef struct luby_range {
+    luby_gc_obj gc;
     luby_value start;
     luby_value end;
     int exclusive;
 } luby_range;
 
 struct luby_proc {
+    luby_gc_obj gc;
     char **param_names;
     size_t param_count;
     luby_chunk *default_chunks;   // bytecode for default values (NULL if no default)
@@ -693,6 +743,7 @@ struct luby_proc {
 };
 
 struct luby_coroutine {
+    luby_gc_obj gc;
     luby_proc *proc;
     int done;
     int started;
@@ -708,6 +759,7 @@ struct luby_module {
 };
 
 typedef struct luby_cmethod {
+    luby_gc_obj gc;
     luby_cfunc fn;
 } luby_cmethod;
 
@@ -724,6 +776,333 @@ static void *luby_alloc_raw(luby_state *L, void *ptr, size_t size) {
     luby_alloc_fn fn = L && L->cfg.alloc ? L->cfg.alloc : luby_default_alloc;
     void *user = L ? L->cfg.alloc_user : NULL;
     return fn(user, ptr, size);
+}
+
+// ------------------------------ GC Core ------------------------------------
+
+#define LUBY_GC_INITIAL_THRESHOLD 256
+
+static void luby_gc_collect(luby_state *L);
+
+// Track a GC object: link into intrusive list and bump counters.
+static void luby_gc_track(luby_state *L, luby_gc_obj *obj, luby_gc_type type) {
+    obj->gc_type = type;
+    obj->gc_marked = 0;
+    obj->gc_next = L->gc_objects;
+    L->gc_objects = obj;
+    L->gc_alloc_count++;
+    L->gc_total++;
+}
+
+// Allocate a GC-tracked object of given size and type.  Triggers collection
+// when the allocation counter reaches the threshold.
+static void *luby_gc_alloc(luby_state *L, size_t size, luby_gc_type type) {
+    if (!L->gc_paused && L->gc_alloc_count >= L->gc_threshold) {
+        luby_gc_collect(L);
+    }
+    void *mem = luby_alloc_raw(L, NULL, size);
+    if (!mem) return NULL;
+    memset(mem, 0, size);
+    luby_gc_track(L, (luby_gc_obj *)mem, type);
+    return mem;
+}
+
+// Allocate a GC-tracked string with data copied in.
+// Returns pointer to the char data (not the header), so it's a
+// drop-in replacement for luby_dup_string in luby_value.as.ptr.
+static char *luby_gc_alloc_string(luby_state *L, const char *data, size_t len) {
+    if (!L->gc_paused && L->gc_alloc_count >= L->gc_threshold) {
+        luby_gc_collect(L);
+    }
+    luby_string_obj *s = (luby_string_obj *)luby_alloc_raw(L, NULL, sizeof(luby_string_obj) + len + 1);
+    if (!s) return NULL;
+    memset(s, 0, sizeof(luby_string_obj));
+    s->length = len;
+    if (data) memcpy(s->data, data, len);
+    s->data[len] = '\0';
+    luby_gc_track(L, &s->gc, LUBY_GC_STRING);
+    return s->data;
+}
+
+// ------------------------------ GC Mark ------------------------------------
+
+static void luby_gc_mark_obj(luby_gc_obj *obj);
+static void luby_gc_mark_value(luby_value v);
+
+static void luby_gc_mark_obj(luby_gc_obj *obj) {
+    if (!obj || obj->gc_marked) return;
+    obj->gc_marked = 1;
+
+    switch (obj->gc_type) {
+        case LUBY_GC_STRING:
+            // Strings have no references
+            break;
+        case LUBY_GC_ARRAY: {
+            luby_array *arr = (luby_array *)obj;
+            for (size_t i = 0; i < arr->count; i++) {
+                luby_gc_mark_value(arr->items[i]);
+            }
+            break;
+        }
+        case LUBY_GC_HASH: {
+            luby_hash *h = (luby_hash *)obj;
+            for (size_t i = 0; i < h->count; i++) {
+                luby_gc_mark_value(h->entries[i].key);
+                luby_gc_mark_value(h->entries[i].value);
+            }
+            break;
+        }
+        case LUBY_GC_CLASS: {
+            luby_class_obj *cls = (luby_class_obj *)obj;
+            if (cls->super) luby_gc_mark_obj(&cls->super->gc);
+            if (cls->methods) luby_gc_mark_obj(&cls->methods->gc);
+            if (cls->singleton_methods) luby_gc_mark_obj(&cls->singleton_methods->gc);
+            if (cls->method_cache) luby_gc_mark_obj(&cls->method_cache->gc);
+            if (cls->singleton_cache) luby_gc_mark_obj(&cls->singleton_cache->gc);
+            for (size_t i = 0; i < cls->included_count; i++) {
+                if (cls->included_modules[i]) luby_gc_mark_obj(&cls->included_modules[i]->gc);
+            }
+            for (size_t i = 0; i < cls->prepended_count; i++) {
+                if (cls->prepended_modules[i]) luby_gc_mark_obj(&cls->prepended_modules[i]->gc);
+            }
+            break;
+        }
+        case LUBY_GC_OBJECT: {
+            luby_object *o = (luby_object *)obj;
+            if (o->klass) luby_gc_mark_obj(&o->klass->gc);
+            if (o->ivars) luby_gc_mark_obj(&o->ivars->gc);
+            if (o->singleton_methods) luby_gc_mark_obj(&o->singleton_methods->gc);
+            for (size_t i = 0; i < o->ivar_count; i++) {
+                luby_gc_mark_value(o->ivar_values[i]);
+            }
+            break;
+        }
+        case LUBY_GC_PROC: {
+            luby_proc *proc = (luby_proc *)obj;
+            // Mark constants in the chunk (strings, procs, etc.)
+            for (size_t i = 0; i < proc->chunk.const_count; i++) {
+                luby_gc_mark_value(proc->chunk.consts[i]);
+            }
+            // Mark default value chunks
+            if (proc->default_chunks) {
+                for (size_t i = 0; i < proc->param_count; i++) {
+                    for (size_t j = 0; j < proc->default_chunks[i].const_count; j++) {
+                        luby_gc_mark_value(proc->default_chunks[i].consts[j]);
+                    }
+                }
+            }
+            break;
+        }
+        case LUBY_GC_RANGE: {
+            luby_range *r = (luby_range *)obj;
+            luby_gc_mark_value(r->start);
+            luby_gc_mark_value(r->end);
+            break;
+        }
+        case LUBY_GC_COROUTINE: {
+            luby_coroutine *co = (luby_coroutine *)obj;
+            if (co->proc) luby_gc_mark_obj(&co->proc->gc);
+            // Mark the coroutine's VM stack
+            for (int i = 0; i < co->vm.sp; i++) {
+                luby_gc_mark_value(co->vm.stack[i]);
+            }
+            // Mark saved values in coroutine VM frames
+            for (int i = 0; i < co->vm.frame_count; i++) {
+                luby_vm_frame *fr = &co->vm.frames[i];
+                luby_gc_mark_value(fr->saved_block);
+                luby_gc_mark_value(fr->saved_self);
+                luby_gc_mark_value(fr->self_saved);
+                if (fr->proc) luby_gc_mark_obj(&fr->proc->gc);
+                for (size_t j = 0; j < fr->param_count; j++) {
+                    if (fr->param_existed && fr->param_existed[j] >= 0) {
+                        luby_gc_mark_value(fr->param_saved[j]);
+                    }
+                }
+                for (size_t j = 0; j < fr->local_count; j++) {
+                    if (fr->local_existed && fr->local_existed[j] >= 0) {
+                        luby_gc_mark_value(fr->local_saved[j]);
+                    }
+                }
+            }
+            luby_gc_mark_value(co->vm.yield_value);
+            luby_gc_mark_value(co->vm.resume_value);
+            break;
+        }
+        case LUBY_GC_CMETHOD:
+            // C methods have no references
+            break;
+    }
+}
+
+static void luby_gc_mark_value(luby_value v) {
+    switch (v.type) {
+        case LUBY_T_STRING:
+            if (v.as.ptr) luby_gc_mark_obj(&LUBY_STRING_OBJ(v.as.ptr)->gc);
+            break;
+        case LUBY_T_ARRAY:
+            if (v.as.ptr) luby_gc_mark_obj(&((luby_array *)v.as.ptr)->gc);
+            break;
+        case LUBY_T_HASH:
+            if (v.as.ptr) luby_gc_mark_obj(&((luby_hash *)v.as.ptr)->gc);
+            break;
+        case LUBY_T_CLASS:
+        case LUBY_T_MODULE:
+            if (v.as.ptr) luby_gc_mark_obj(&((luby_class_obj *)v.as.ptr)->gc);
+            break;
+        case LUBY_T_OBJECT:
+            if (v.as.ptr) luby_gc_mark_obj(&((luby_object *)v.as.ptr)->gc);
+            break;
+        case LUBY_T_PROC:
+            if (v.as.ptr) luby_gc_mark_obj(&((luby_proc *)v.as.ptr)->gc);
+            break;
+        case LUBY_T_RANGE:
+            if (v.as.ptr) luby_gc_mark_obj(&((luby_range *)v.as.ptr)->gc);
+            break;
+        case LUBY_T_CMETHOD:
+            if (v.as.ptr) luby_gc_mark_obj(&((luby_cmethod *)v.as.ptr)->gc);
+            break;
+        default:
+            // NIL, BOOL, INT, FLOAT, SYMBOL — no heap allocation or interned
+            break;
+    }
+}
+
+// Mark all roots: globals, VM stack, frame saved values, current_* pointers
+static void luby_gc_mark_roots(luby_state *L) {
+    // Global values
+    for (size_t i = 0; i < L->global_count; i++) {
+        luby_gc_mark_value(L->global_values[i]);
+    }
+    // Current block, class, self
+    luby_gc_mark_value(L->current_block);
+    luby_gc_mark_value(L->current_class);
+    luby_gc_mark_value(L->current_self);
+    if (L->current_method_class) luby_gc_mark_obj(&L->current_method_class->gc);
+    // Current VM stack and frames
+    if (L->current_vm) {
+        luby_vm *vm = L->current_vm;
+        for (int i = 0; i < vm->sp; i++) {
+            luby_gc_mark_value(vm->stack[i]);
+        }
+        for (int i = 0; i < vm->frame_count; i++) {
+            luby_vm_frame *fr = &vm->frames[i];
+            luby_gc_mark_value(fr->saved_block);
+            luby_gc_mark_value(fr->saved_self);
+            luby_gc_mark_value(fr->self_saved);
+            if (fr->proc) luby_gc_mark_obj(&fr->proc->gc);
+            if (fr->chunk) {
+                for (size_t j = 0; j < fr->chunk->const_count; j++) {
+                    luby_gc_mark_value(fr->chunk->consts[j]);
+                }
+            }
+            for (size_t j = 0; j < fr->param_count; j++) {
+                if (fr->param_existed && fr->param_existed[j] >= 0) {
+                    luby_gc_mark_value(fr->param_saved[j]);
+                }
+            }
+            for (size_t j = 0; j < fr->local_count; j++) {
+                if (fr->local_existed && fr->local_existed[j] >= 0) {
+                    luby_gc_mark_value(fr->local_saved[j]);
+                }
+            }
+        }
+        luby_gc_mark_value(vm->yield_value);
+        luby_gc_mark_value(vm->resume_value);
+    }
+    // Current coroutine
+    if (L->current_coroutine) {
+        luby_gc_mark_obj(&L->current_coroutine->gc);
+    }
+}
+
+// ------------------------------ GC Sweep -----------------------------------
+
+static void luby_vm_free(luby_state *L, luby_vm *vm);
+static void luby_proc_free(luby_state *L, luby_proc *proc);
+
+static void luby_gc_free_obj(luby_state *L, luby_gc_obj *obj) {
+    switch (obj->gc_type) {
+        case LUBY_GC_STRING:
+            // String obj is the allocation (data[] is flexible member)
+            luby_alloc_raw(L, obj, 0);
+            break;
+        case LUBY_GC_ARRAY: {
+            luby_array *arr = (luby_array *)obj;
+            if (arr->items) luby_alloc_raw(L, arr->items, 0);
+            luby_alloc_raw(L, obj, 0);
+            break;
+        }
+        case LUBY_GC_HASH: {
+            luby_hash *h = (luby_hash *)obj;
+            if (h->entries) luby_alloc_raw(L, h->entries, 0);
+            luby_alloc_raw(L, obj, 0);
+            break;
+        }
+        case LUBY_GC_CLASS: {
+            luby_class_obj *cls = (luby_class_obj *)obj;
+            if (cls->name) luby_alloc_raw(L, cls->name, 0);
+            if (cls->included_modules) luby_alloc_raw(L, cls->included_modules, 0);
+            if (cls->prepended_modules) luby_alloc_raw(L, cls->prepended_modules, 0);
+            // methods, singleton_methods, method_cache, singleton_cache are GC hashes
+            luby_alloc_raw(L, obj, 0);
+            break;
+        }
+        case LUBY_GC_OBJECT: {
+            luby_object *o = (luby_object *)obj;
+            if (o->ivar_names) {
+                for (size_t i = 0; i < o->ivar_count; i++) {
+                    luby_alloc_raw(L, o->ivar_names[i], 0);
+                }
+                luby_alloc_raw(L, o->ivar_names, 0);
+            }
+            if (o->ivar_values) luby_alloc_raw(L, o->ivar_values, 0);
+            // ivars, singleton_methods are GC hashes
+            luby_alloc_raw(L, obj, 0);
+            break;
+        }
+        case LUBY_GC_PROC: {
+            luby_proc *proc = (luby_proc *)obj;
+            luby_proc_free(L, proc);
+            luby_alloc_raw(L, obj, 0);
+            break;
+        }
+        case LUBY_GC_RANGE:
+            luby_alloc_raw(L, obj, 0);
+            break;
+        case LUBY_GC_COROUTINE: {
+            luby_coroutine *co = (luby_coroutine *)obj;
+            luby_vm_free(L, &co->vm);
+            luby_alloc_raw(L, obj, 0);
+            break;
+        }
+        case LUBY_GC_CMETHOD:
+            luby_alloc_raw(L, obj, 0);
+            break;
+    }
+}
+
+static void luby_gc_sweep(luby_state *L) {
+    luby_gc_obj **p = &L->gc_objects;
+    while (*p) {
+        if (!(*p)->gc_marked) {
+            luby_gc_obj *unreached = *p;
+            *p = unreached->gc_next;
+            luby_gc_free_obj(L, unreached);
+            L->gc_total--;
+        } else {
+            (*p)->gc_marked = 0;
+            p = &(*p)->gc_next;
+        }
+    }
+}
+
+static void luby_gc_collect(luby_state *L) {
+    if (!L || L->gc_paused) return;
+    luby_gc_mark_roots(L);
+    luby_gc_sweep(L);
+    // Grow threshold: next collection after at least as many live objects again
+    L->gc_threshold = L->gc_total < LUBY_GC_INITIAL_THRESHOLD ? LUBY_GC_INITIAL_THRESHOLD : L->gc_total * 2;
+    L->gc_alloc_count = 0;
 }
 
 static void luby_set_error(luby_state *L, luby_error_code code, const char *message, const char *file, int line, int column) {
@@ -899,7 +1278,7 @@ static int luby_hash_get_value_found(luby_value h, luby_value key, luby_value *o
 }
 
 static luby_hash *luby_hash_new_heap(luby_state *L) {
-    luby_hash *h = (luby_hash *)luby_alloc_raw(L, NULL, sizeof(luby_hash));
+    luby_hash *h = (luby_hash *)luby_gc_alloc(L, sizeof(luby_hash), LUBY_GC_HASH);
     if (!h) return NULL;
     h->count = 0;
     h->capacity = 0;
@@ -909,8 +1288,12 @@ static luby_hash *luby_hash_new_heap(luby_state *L) {
 }
 
 static luby_class_obj *luby_class_new(luby_state *L, const char *name, luby_class_obj *super) {
-    luby_class_obj *cls = (luby_class_obj *)luby_alloc_raw(L, NULL, sizeof(luby_class_obj));
-    if (!cls) return NULL;
+    // Pause GC during construction - sub-allocations could trigger collection
+    // before this object is reachable from roots
+    int was_paused = L->gc_paused;
+    L->gc_paused = 1;
+    luby_class_obj *cls = (luby_class_obj *)luby_gc_alloc(L, sizeof(luby_class_obj), LUBY_GC_CLASS);
+    if (!cls) { L->gc_paused = was_paused; return NULL; }
     cls->name = name ? luby_dup_string(L, name, strlen(name)) : NULL;
     cls->super = super;
     cls->methods = luby_hash_new_heap(L);
@@ -926,12 +1309,16 @@ static luby_class_obj *luby_class_new(luby_state *L, const char *name, luby_clas
     cls->singleton_cache = luby_hash_new_heap(L);
     cls->singleton_cache_epoch = 0;
     cls->frozen = 0;
+    L->gc_paused = was_paused;
     return cls;
 }
 
 static luby_object *luby_object_new(luby_state *L, luby_class_obj *cls) {
-    luby_object *obj = (luby_object *)luby_alloc_raw(L, NULL, sizeof(luby_object));
-    if (!obj) return NULL;
+    // Pause GC during construction - sub-allocations could trigger collection
+    int was_paused = L->gc_paused;
+    L->gc_paused = 1;
+    luby_object *obj = (luby_object *)luby_gc_alloc(L, sizeof(luby_object), LUBY_GC_OBJECT);
+    if (!obj) { L->gc_paused = was_paused; return NULL; }
     obj->klass = cls;
     obj->ivars = luby_hash_new_heap(L);
     obj->singleton_methods = luby_hash_new_heap(L);
@@ -939,6 +1326,7 @@ static luby_object *luby_object_new(luby_state *L, luby_class_obj *cls) {
     obj->ivar_names = NULL;
     obj->ivar_values = NULL;
     obj->ivar_count = 0;
+    L->gc_paused = was_paused;
     return obj;
 }
 
@@ -1698,6 +2086,286 @@ static luby_ast_node *luby_new_node(luby_state *L, luby_ast_kind kind, int line,
     return node;
 }
 
+// Deep-copy an AST node and all its children
+static luby_ast_node *luby_dup_ast(luby_state *L, luby_ast_node *node) {
+    if (!node) return NULL;
+    luby_ast_node *copy = luby_new_node(L, node->kind, node->line, node->column);
+    if (!copy) return NULL;
+    
+    switch (node->kind) {
+        case LUBY_AST_NIL:
+        case LUBY_AST_BOOL:
+        case LUBY_AST_INT:
+        case LUBY_AST_FLOAT:
+        case LUBY_AST_STRING:
+        case LUBY_AST_LITERAL:
+        case LUBY_AST_SYMBOL:
+        case LUBY_AST_IDENT:
+        case LUBY_AST_CONST:
+        case LUBY_AST_IVAR:
+        case LUBY_AST_REDO:
+        case LUBY_AST_SPLAT_PARAM:
+        case LUBY_AST_BLOCK_PARAM:
+            // Leaf nodes, just copy literal
+            copy->as.literal = node->as.literal;
+            break;
+        case LUBY_AST_BREAK:
+        case LUBY_AST_NEXT:
+            // Break and next can have optional value expressions
+            copy->as.ret.value = luby_dup_ast(L, node->as.ret.value);
+            break;
+        case LUBY_AST_INTERP_STRING:
+        case LUBY_AST_ARRAY:
+        case LUBY_AST_HASH:
+        case LUBY_AST_BLOCK:
+            // List nodes
+            if (node->as.list.count > 0) {
+                copy->as.list.items = (luby_ast_node **)luby_alloc_raw(L, NULL, node->as.list.count * sizeof(luby_ast_node *));
+                if (!copy->as.list.items) { luby_alloc_raw(L, copy, 0); return NULL; }
+                copy->as.list.count = node->as.list.count;
+                for (size_t i = 0; i < node->as.list.count; i++) {
+                    copy->as.list.items[i] = luby_dup_ast(L, node->as.list.items[i]);
+                }
+            }
+            break;
+        case LUBY_AST_PAIR:
+        case LUBY_AST_RANGE:
+            copy->as.pair.left = luby_dup_ast(L, node->as.pair.left);
+            copy->as.pair.right = luby_dup_ast(L, node->as.pair.right);
+            break;
+        case LUBY_AST_ASSIGN:
+        case LUBY_AST_IVAR_ASSIGN:
+        case LUBY_AST_DEFAULT_PARAM:
+            copy->as.assign.target = luby_dup_ast(L, node->as.assign.target);
+            copy->as.assign.value = luby_dup_ast(L, node->as.assign.value);
+            break;
+        case LUBY_AST_MULTI_ASSIGN:
+            if (node->as.multi_assign.target_count > 0) {
+                copy->as.multi_assign.targets = (luby_ast_node **)luby_alloc_raw(L, NULL, node->as.multi_assign.target_count * sizeof(luby_ast_node *));
+                copy->as.multi_assign.target_count = node->as.multi_assign.target_count;
+                for (size_t i = 0; i < node->as.multi_assign.target_count; i++) {
+                    copy->as.multi_assign.targets[i] = luby_dup_ast(L, node->as.multi_assign.targets[i]);
+                }
+            }
+            if (node->as.multi_assign.value_count > 0) {
+                copy->as.multi_assign.values = (luby_ast_node **)luby_alloc_raw(L, NULL, node->as.multi_assign.value_count * sizeof(luby_ast_node *));
+                copy->as.multi_assign.value_count = node->as.multi_assign.value_count;
+                for (size_t i = 0; i < node->as.multi_assign.value_count; i++) {
+                    copy->as.multi_assign.values[i] = luby_dup_ast(L, node->as.multi_assign.values[i]);
+                }
+            }
+            break;
+        case LUBY_AST_INDEX:
+            copy->as.index.target = luby_dup_ast(L, node->as.index.target);
+            copy->as.index.index = luby_dup_ast(L, node->as.index.index);
+            copy->as.index.safe = node->as.index.safe;
+            break;
+        case LUBY_AST_INDEX_ASSIGN:
+            copy->as.index_assign.target = luby_dup_ast(L, node->as.index_assign.target);
+            copy->as.index_assign.index = luby_dup_ast(L, node->as.index_assign.index);
+            copy->as.index_assign.value = luby_dup_ast(L, node->as.index_assign.value);
+            break;
+        case LUBY_AST_CALL:
+            copy->as.call.recv = luby_dup_ast(L, node->as.call.recv);
+            copy->as.call.method = node->as.call.method;
+            copy->as.call.safe = node->as.call.safe;
+            if (node->as.call.argc > 0) {
+                copy->as.call.args = (luby_ast_node **)luby_alloc_raw(L, NULL, node->as.call.argc * sizeof(luby_ast_node *));
+                copy->as.call.argc = node->as.call.argc;
+                for (size_t i = 0; i < node->as.call.argc; i++) {
+                    copy->as.call.args[i] = luby_dup_ast(L, node->as.call.args[i]);
+                }
+            }
+            copy->as.call.block = luby_dup_ast(L, node->as.call.block);
+            break;
+        case LUBY_AST_LAMBDA:
+            if (node->as.lambda.param_count > 0) {
+                copy->as.lambda.params = (luby_ast_node **)luby_alloc_raw(L, NULL, node->as.lambda.param_count * sizeof(luby_ast_node *));
+                copy->as.lambda.param_count = node->as.lambda.param_count;
+                for (size_t i = 0; i < node->as.lambda.param_count; i++) {
+                    copy->as.lambda.params[i] = luby_dup_ast(L, node->as.lambda.params[i]);
+                }
+            }
+            copy->as.lambda.body = luby_dup_ast(L, node->as.lambda.body);
+            break;
+        case LUBY_AST_CLASS:
+            copy->as.class_decl.name = node->as.class_decl.name;
+            copy->as.class_decl.super_name = node->as.class_decl.super_name;
+            copy->as.class_decl.body = luby_dup_ast(L, node->as.class_decl.body);
+            break;
+        case LUBY_AST_MODULE:
+            copy->as.module_decl.name = node->as.module_decl.name;
+            copy->as.module_decl.body = luby_dup_ast(L, node->as.module_decl.body);
+            break;
+        case LUBY_AST_DEF:
+            copy->as.defn.name = node->as.defn.name;
+            copy->as.defn.receiver = luby_dup_ast(L, node->as.defn.receiver);
+            if (node->as.defn.param_count > 0) {
+                copy->as.defn.params = (luby_ast_node **)luby_alloc_raw(L, NULL, node->as.defn.param_count * sizeof(luby_ast_node *));
+                copy->as.defn.param_count = node->as.defn.param_count;
+                for (size_t i = 0; i < node->as.defn.param_count; i++) {
+                    copy->as.defn.params[i] = luby_dup_ast(L, node->as.defn.params[i]);
+                }
+            }
+            copy->as.defn.body = luby_dup_ast(L, node->as.defn.body);
+            break;
+        case LUBY_AST_IF:
+        case LUBY_AST_TERNARY:
+            copy->as.if_stmt.cond = luby_dup_ast(L, node->as.if_stmt.cond);
+            copy->as.if_stmt.then_branch = luby_dup_ast(L, node->as.if_stmt.then_branch);
+            copy->as.if_stmt.else_branch = luby_dup_ast(L, node->as.if_stmt.else_branch);
+            break;
+        case LUBY_AST_WHILE:
+            copy->as.while_stmt.cond = luby_dup_ast(L, node->as.while_stmt.cond);
+            copy->as.while_stmt.body = luby_dup_ast(L, node->as.while_stmt.body);
+            break;
+        case LUBY_AST_RETURN:
+            copy->as.ret.value = luby_dup_ast(L, node->as.ret.value);
+            break;
+        case LUBY_AST_BEGIN:
+            copy->as.begin.body = luby_dup_ast(L, node->as.begin.body);
+            copy->as.begin.rescue_body = luby_dup_ast(L, node->as.begin.rescue_body);
+            copy->as.begin.ensure_body = luby_dup_ast(L, node->as.begin.ensure_body);
+            break;
+        case LUBY_AST_BINARY:
+            copy->as.binary.op = node->as.binary.op;
+            copy->as.binary.left = luby_dup_ast(L, node->as.binary.left);
+            copy->as.binary.right = luby_dup_ast(L, node->as.binary.right);
+            break;
+        case LUBY_AST_UNARY:
+            copy->as.unary.op = node->as.unary.op;
+            copy->as.unary.expr = luby_dup_ast(L, node->as.unary.expr);
+            break;
+    }
+    return copy;
+}
+
+static void luby_free_ast(luby_state *L, luby_ast_node *node) {
+    if (!node) return;
+    switch (node->kind) {
+        case LUBY_AST_NIL:
+        case LUBY_AST_BOOL:
+        case LUBY_AST_INT:
+        case LUBY_AST_FLOAT:
+        case LUBY_AST_STRING:
+        case LUBY_AST_LITERAL:
+        case LUBY_AST_SYMBOL:
+        case LUBY_AST_IDENT:
+        case LUBY_AST_CONST:
+        case LUBY_AST_IVAR:
+        case LUBY_AST_REDO:
+            // Leaf nodes, nothing to free
+            break;
+        case LUBY_AST_BREAK:
+        case LUBY_AST_NEXT:
+            // Break and next can have optional value expressions
+            luby_free_ast(L, node->as.ret.value);
+            break;
+        case LUBY_AST_INTERP_STRING:
+        case LUBY_AST_ARRAY:
+        case LUBY_AST_HASH:
+        case LUBY_AST_BLOCK:
+            // List nodes
+            for (size_t i = 0; i < node->as.list.count; i++) {
+                luby_free_ast(L, node->as.list.items[i]);
+            }
+            luby_alloc_raw(L, node->as.list.items, 0);
+            break;
+        case LUBY_AST_PAIR:
+        case LUBY_AST_RANGE:
+            luby_free_ast(L, node->as.pair.left);
+            luby_free_ast(L, node->as.pair.right);
+            break;
+        case LUBY_AST_ASSIGN:
+        case LUBY_AST_IVAR_ASSIGN:
+            luby_free_ast(L, node->as.assign.target);
+            luby_free_ast(L, node->as.assign.value);
+            break;
+        case LUBY_AST_DEFAULT_PARAM:
+            luby_free_ast(L, node->as.assign.target);
+            luby_free_ast(L, node->as.assign.value);
+            break;
+        case LUBY_AST_SPLAT_PARAM:
+        case LUBY_AST_BLOCK_PARAM:
+            // These store just a literal (name), no children to free
+            break;
+        case LUBY_AST_MULTI_ASSIGN:
+            for (size_t i = 0; i < node->as.multi_assign.target_count; i++) {
+                luby_free_ast(L, node->as.multi_assign.targets[i]);
+            }
+            luby_alloc_raw(L, node->as.multi_assign.targets, 0);
+            for (size_t i = 0; i < node->as.multi_assign.value_count; i++) {
+                luby_free_ast(L, node->as.multi_assign.values[i]);
+            }
+            luby_alloc_raw(L, node->as.multi_assign.values, 0);
+            break;
+        case LUBY_AST_INDEX:
+            luby_free_ast(L, node->as.index.target);
+            luby_free_ast(L, node->as.index.index);
+            break;
+        case LUBY_AST_INDEX_ASSIGN:
+            luby_free_ast(L, node->as.index_assign.target);
+            luby_free_ast(L, node->as.index_assign.index);
+            luby_free_ast(L, node->as.index_assign.value);
+            break;
+        case LUBY_AST_CALL:
+            luby_free_ast(L, node->as.call.recv);
+            for (size_t i = 0; i < node->as.call.argc; i++) {
+                luby_free_ast(L, node->as.call.args[i]);
+            }
+            luby_alloc_raw(L, node->as.call.args, 0);
+            luby_free_ast(L, node->as.call.block);
+            break;
+        case LUBY_AST_LAMBDA:
+            for (size_t i = 0; i < node->as.lambda.param_count; i++) {
+                luby_free_ast(L, node->as.lambda.params[i]);
+            }
+            luby_alloc_raw(L, node->as.lambda.params, 0);
+            luby_free_ast(L, node->as.lambda.body);
+            break;
+        case LUBY_AST_CLASS:
+            luby_free_ast(L, node->as.class_decl.body);
+            break;
+        case LUBY_AST_MODULE:
+            luby_free_ast(L, node->as.module_decl.body);
+            break;
+        case LUBY_AST_DEF:
+            luby_free_ast(L, node->as.defn.receiver);
+            for (size_t i = 0; i < node->as.defn.param_count; i++) {
+                luby_free_ast(L, node->as.defn.params[i]);
+            }
+            luby_alloc_raw(L, node->as.defn.params, 0);
+            luby_free_ast(L, node->as.defn.body);
+            break;
+        case LUBY_AST_IF:
+        case LUBY_AST_TERNARY:
+            luby_free_ast(L, node->as.if_stmt.cond);
+            luby_free_ast(L, node->as.if_stmt.then_branch);
+            luby_free_ast(L, node->as.if_stmt.else_branch);
+            break;
+        case LUBY_AST_WHILE:
+            luby_free_ast(L, node->as.while_stmt.cond);
+            luby_free_ast(L, node->as.while_stmt.body);
+            break;
+        case LUBY_AST_RETURN:
+            luby_free_ast(L, node->as.ret.value);
+            break;
+        case LUBY_AST_BEGIN:
+            luby_free_ast(L, node->as.begin.body);
+            luby_free_ast(L, node->as.begin.rescue_body);
+            luby_free_ast(L, node->as.begin.ensure_body);
+            break;
+        case LUBY_AST_BINARY:
+            luby_free_ast(L, node->as.binary.left);
+            luby_free_ast(L, node->as.binary.right);
+            break;
+        case LUBY_AST_UNARY:
+            luby_free_ast(L, node->as.unary.expr);
+            break;
+    }
+    luby_alloc_raw(L, node, 0);
+}
+
 static void luby_parser_init(luby_parser *p, const char *code, size_t len, const char *filename, luby_error *error_out) {
     luby_lexer_init(&p->lex, code, len, filename);
     p->current = luby_lexer_next(&p->lex);
@@ -2067,6 +2735,8 @@ static luby_ast_node *luby_parse_primary(luby_state *L, luby_parser *p) {
                 }
                 node->as.lambda.params = params->as.list.items;
                 node->as.lambda.param_count = params->as.list.count;
+                // Free the wrapper block node (not items array or children)
+                luby_alloc_raw(L, params, 0);
             }
             
             // Body must be in braces: { ... }
@@ -2214,6 +2884,8 @@ static luby_ast_node *luby_parse_postfix(luby_state *L, luby_parser *p, luby_ast
             luby_parser_advance(p);
             luby_ast_node *call = luby_make_call(L, NULL, ident_tok, left->line, left->column);
             if (!call) return NULL;
+            // Free the identifier node now that we've converted it to a call
+            luby_alloc_raw(L, left, 0);
             luby_parse_call_args(L, p, call);
             if (!luby_parser_match(p, LUBY_TOK_RPAREN)) {
                 luby_parser_error(p, "expected ')'");
@@ -2230,8 +2902,10 @@ static luby_ast_node *luby_parse_postfix(luby_state *L, luby_parser *p, luby_ast
 
             if (left->kind != LUBY_AST_CALL) {
                 if (left->kind == LUBY_AST_IDENT || left->kind == LUBY_AST_CONST) {
+                    luby_ast_node *old_left = left;
                     luby_ast_node *call = luby_make_call(L, NULL, left->as.literal, left->line, left->column);
                     if (!call) return NULL;
+                    luby_alloc_raw(L, old_left, 0);  // Free the identifier node
                     left = call;
                 } else {
                     return left;
@@ -2409,6 +3083,8 @@ static luby_ast_node *luby_parse_block_expr(luby_state *L, luby_parser *p, luby_
         }
         node->as.lambda.params = params->as.list.items;
         node->as.lambda.param_count = params->as.list.count;
+        // Free the wrapper block node (not items array or children)
+        luby_alloc_raw(L, params, 0);
     }
 
     node->as.lambda.body = luby_parse_block_until(L, p, end_kind);
@@ -2517,6 +3193,8 @@ static luby_ast_node *luby_parse_def(luby_state *L, luby_parser *p) {
         luby_ast_node *params = luby_parse_params(L, p);
         node->as.defn.params = params ? params->as.list.items : NULL;
         node->as.defn.param_count = params ? params->as.list.count : 0;
+        // Free the wrapper block node (not the items array or children, they're now owned by node)
+        if (params) luby_alloc_raw(L, params, 0);
         if (!luby_parser_match(p, LUBY_TOK_RPAREN)) {
             luby_parser_error(p, "expected ')'");
         }
@@ -2709,6 +3387,8 @@ static luby_ast_node *luby_parse_for(luby_state *L, luby_parser *p) {
     lambda->as.lambda.params = params->as.list.items;
     lambda->as.lambda.param_count = params->as.list.count;
     lambda->as.lambda.body = body;
+    // Free the wrapper BLOCK node (we moved its contents to lambda)
+    luby_alloc_raw(L, params, 0);
 
     luby_string_view method = { "each", 4 };
     luby_ast_node *call = luby_make_call(L, iterable, method, for_tok.line, for_tok.column);
@@ -2848,13 +3528,20 @@ static luby_ast_node *luby_parse_case(luby_state *L, luby_parser *p) {
     while (p->current.kind == LUBY_TOK_WHEN) {
         luby_parser_advance(p);
         luby_ast_node *cond = NULL;
+        int first_comparison = 1;
         do {
             luby_ast_node *when_expr = luby_parse_expr(L, p, 0);
             if (!when_expr) return NULL;
             luby_ast_node *eq = luby_new_node(L, LUBY_AST_BINARY, case_tok.line, case_tok.column);
             if (!eq) return NULL;
             eq->as.binary.op = LUBY_TOK_EQEQ;
-            eq->as.binary.left = case_expr;
+            // First comparison uses the original case_expr, others use copies
+            if (first_comparison) {
+                eq->as.binary.left = luby_dup_ast(L, case_expr);
+                first_comparison = 0;
+            } else {
+                eq->as.binary.left = luby_dup_ast(L, case_expr);
+            }
             eq->as.binary.right = when_expr;
             if (!cond) {
                 cond = eq;
@@ -2900,6 +3587,8 @@ static luby_ast_node *luby_parse_case(luby_state *L, luby_parser *p) {
     if (!luby_parser_match(p, LUBY_TOK_END)) {
         luby_parser_error(p, "expected 'end'");
     }
+    // Free the original case_expr since all uses are now copies
+    luby_free_ast(L, case_expr);
     return root;
 }
 
@@ -3170,6 +3859,8 @@ static luby_ast_node *luby_parse_assignment_from(luby_state *L, luby_parser *p, 
         node->as.index_assign.target = lhs->as.index.target;
         node->as.index_assign.index = lhs->as.index.index;
         node->as.index_assign.value = rhs;
+        // Free the wrapper INDEX node (but not its children, we just moved them)
+        luby_alloc_raw(L, lhs, 0);
         return node;
     }
     luby_parser_error(p, "invalid assignment target");
@@ -3249,22 +3940,25 @@ static void luby_proc_free(luby_state *L, luby_proc *proc) {
         luby_alloc_raw(L, proc->param_names[i], 0);
     }
     luby_alloc_raw(L, proc->param_names, 0);
+    for (size_t i = 0; i < proc->local_count; i++) {
+        luby_alloc_raw(L, proc->local_names[i], 0);
+    }
+    luby_alloc_raw(L, proc->local_names, 0);
+    if (proc->block_param_name) luby_alloc_raw(L, proc->block_param_name, 0);
+    if (proc->default_chunks) {
+        for (size_t i = 0; i < proc->param_count; i++) {
+            luby_chunk_free(L, &proc->default_chunks[i]);
+        }
+        luby_alloc_raw(L, proc->default_chunks, 0);
+    }
     luby_chunk_free(L, &proc->chunk);
-    luby_alloc_raw(L, proc, 0);
+    // Note: the proc struct itself is freed by the GC sweep, not here.
 }
 
 static void luby_chunk_free(luby_state *L, luby_chunk *chunk) {
     if (!chunk) return;
-    for (size_t i = 0; i < chunk->const_count; i++) {
-        if (chunk->consts[i].type == LUBY_T_STRING) {
-            luby_alloc_raw(L, chunk->consts[i].as.ptr, 0);
-        } else if (chunk->consts[i].type == LUBY_T_PROC) {
-            luby_proc *proc = (luby_proc *)chunk->consts[i].as.ptr;
-            if (proc && proc->owned_by_chunk) {
-                luby_proc_free(L, proc);
-            }
-        }
-    }
+    // String consts are GC-tracked; symbol consts are interned; proc consts are GC-tracked.
+    // Only free the infrastructure arrays (code, lines, consts).
     luby_alloc_raw(L, chunk->code, 0);
     luby_alloc_raw(L, chunk->lines, 0);
     luby_alloc_raw(L, chunk->consts, 0);
@@ -3475,7 +4169,7 @@ static int luby_vm_push_frame(luby_state *L, luby_vm *vm, luby_proc *proc, luby_
             luby_value v = luby_nil();
             if (splat_idx >= 0 && (int)i == splat_idx) {
                 // Collect remaining args into array for splat param
-                luby_array *arr = (luby_array *)luby_alloc_raw(L, NULL, sizeof(luby_array));
+                luby_array *arr = (luby_array *)luby_gc_alloc(L, sizeof(luby_array), LUBY_GC_ARRAY);
                 if (arr) {
                     size_t splat_count = ((size_t)argc > regular_count) ? (size_t)argc - regular_count : 0;
                     arr->count = splat_count;
@@ -3589,12 +4283,15 @@ static void luby_vm_pop_frame(luby_state *L, luby_vm *vm, luby_value ret, int pu
     L->current_method_class = f->saved_method_class;
     L->current_method_name = f->saved_method_name;
 
+    // Check for return override (used by new/initialize)
+    luby_value final_ret = f->has_return_override ? f->return_override : ret;
+
     vm->sp = f->stack_base;
     vm->frame_count--;
 
     if (push_ret) {
         if (luby_vm_ensure_stack(L, vm, 1)) {
-            vm->stack[vm->sp++] = ret;
+            vm->stack[vm->sp++] = final_ret;
         }
     }
 }
@@ -3744,23 +4441,31 @@ static int luby_vm_run(luby_state *L, luby_vm *vm, luby_value *out) {
                         const char *sa = a.as.ptr ? (const char *)a.as.ptr : "";
                         const char *sb = b.as.ptr ? (const char *)b.as.ptr : "";
                         size_t la = strlen(sa), lb = strlen(sb);
-                        char *buf = (char *)luby_alloc_raw(L, NULL, la + lb + 1);
-                        if (!buf) { luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
+                        // Pause GC - a and b are popped, allocation could free them
+                        int was_paused = L->gc_paused;
+                        L->gc_paused = 1;
+                        char *buf = luby_gc_alloc_string(L, NULL, la + lb);
+                        if (!buf) { L->gc_paused = was_paused; luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
                         memcpy(buf, sa, la);
                         memcpy(buf + la, sb, lb);
                         buf[la + lb] = '\0';
+                        L->gc_paused = was_paused;
                         luby_value sv; sv.type = LUBY_T_STRING; sv.as.ptr = buf;
                         vm->stack[vm->sp++] = sv;
                     } else if (inst.op == LUBY_OP_ADD && a.type == LUBY_T_ARRAY && b.type == LUBY_T_ARRAY) {
                         luby_array *aa = (luby_array *)a.as.ptr;
                         luby_array *ba = (luby_array *)b.as.ptr;
                         size_t ac = aa ? aa->count : 0, bc = ba ? ba->count : 0;
-                        luby_array *ra = (luby_array *)luby_alloc_raw(L, NULL, sizeof(luby_array));
-                        if (!ra) { luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
+                        // Pause GC - a and b are popped, allocation could free them
+                        int was_paused = L->gc_paused;
+                        L->gc_paused = 1;
+                        luby_array *ra = (luby_array *)luby_gc_alloc(L, sizeof(luby_array), LUBY_GC_ARRAY);
+                        if (!ra) { L->gc_paused = was_paused; luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
                         ra->count = ac + bc; ra->capacity = ac + bc > 0 ? ac + bc : 1; ra->frozen = 0;
                         ra->items = (luby_value *)luby_alloc_raw(L, NULL, ra->capacity * sizeof(luby_value));
                         if (ac > 0) memcpy(ra->items, aa->items, ac * sizeof(luby_value));
                         if (bc > 0) memcpy(ra->items + ac, ba->items, bc * sizeof(luby_value));
+                        L->gc_paused = was_paused;
                         luby_value rv; rv.type = LUBY_T_ARRAY; rv.as.ptr = ra;
                         vm->stack[vm->sp++] = rv;
                     } else if (a.type == LUBY_T_INT && b.type == LUBY_T_INT) {
@@ -3846,7 +4551,7 @@ static int luby_vm_run(luby_state *L, luby_vm *vm, luby_value *out) {
                 }
                 case LUBY_OP_MAKE_ARRAY: {
                     uint8_t count = inst.a;
-                    luby_array *arr = (luby_array *)luby_alloc_raw(L, NULL, sizeof(luby_array));
+                    luby_array *arr = (luby_array *)luby_gc_alloc(L, sizeof(luby_array), LUBY_GC_ARRAY);
                     if (!arr) { luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
                     arr->count = count;
                     arr->capacity = count;
@@ -3863,7 +4568,7 @@ static int luby_vm_run(luby_state *L, luby_vm *vm, luby_value *out) {
                 }
                 case LUBY_OP_MAKE_HASH: {
                     uint8_t count = inst.a;
-                    luby_hash *h = (luby_hash *)luby_alloc_raw(L, NULL, sizeof(luby_hash));
+                    luby_hash *h = (luby_hash *)luby_gc_alloc(L, sizeof(luby_hash), LUBY_GC_HASH);
                     if (!h) { luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
                     h->count = count;
                     h->capacity = count;
@@ -4026,6 +4731,28 @@ set_index_done:
                                 luby_object *obj = luby_object_new(L, cls);
                                 if (!obj) { luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
                                 r.type = LUBY_T_OBJECT; r.as.ptr = obj;
+                                // Check for initialize method and call it
+                                luby_proc *init = luby_class_get_method(L, cls, "initialize");
+                                if (init) {
+                                    luby_value block = L->current_block;
+                                    L->current_block = luby_nil();
+                                    f->ip++;
+                                    // Push the new object as return value first - it will be replaced by frame pop
+                                    // Actually: we need to return obj, not the result of initialize
+                                    // So we push obj onto stack, then set up frame to call init
+                                    // When init returns, it pops its return value, but we've already pushed obj
+                                    // This is tricky - we need a different approach
+                                    // Save obj in a temp, call init, then push obj
+                                    // For now, push frame for initialize with obj as self
+                                    if (!luby_vm_push_frame(L, vm, init, &init->chunk, "<initialize>", r, cls, "initialize", use - 1, args + 1, block, 1)) {
+                                        luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0);
+                                        goto vm_error;
+                                    }
+                                    // Mark that we should return obj, not init's return value
+                                    vm->frames[vm->frame_count - 1].return_override = r;
+                                    vm->frames[vm->frame_count - 1].has_return_override = 1;
+                                    goto vm_next_frame;
+                                }
                                 L->current_block = luby_nil();
                                 vm->stack[vm->sp++] = r;
                                 break;
@@ -4239,8 +4966,8 @@ set_index_done:
                         }
                     }
 
-                    // Allocate result string
-                    char *result = (char *)luby_alloc_raw(L, NULL, total_len + 1);
+                    // Allocate result string (GC-tracked)
+                    char *result = luby_gc_alloc_string(L, NULL, total_len);
                     if (!result) { luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
 
                     // Concatenate
@@ -4248,7 +4975,7 @@ set_index_done:
                     for (int i = 0; i < count; i++) {
                         memcpy(p, parts[i], lens[i]);
                         p += lens[i];
-                        luby_alloc_raw(L, parts[i], 0); // free part
+                        luby_alloc_raw(L, parts[i], 0); // free temporary part
                     }
                     *p = '\0';
                     if (parts) luby_alloc_raw(L, parts, 0);
@@ -4380,7 +5107,7 @@ set_index_done:
                     luby_value start_val = vm->stack[--vm->sp];
                     int exclusive = inst.a;
                     // Create range object
-                    luby_range *range = (luby_range *)luby_alloc_raw(L, NULL, sizeof(luby_range));
+                    luby_range *range = (luby_range *)luby_gc_alloc(L, sizeof(luby_range), LUBY_GC_RANGE);
                     if (!range) { luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
                     range->start = start_val;
                     range->end = end_val;
@@ -4544,7 +5271,7 @@ static int luby_compile_literal(luby_compiler *C, luby_ast_node *node) {
                 v = luby_symbol(C->L, s + start, len);
                 if (!v.as.ptr) return 0;
             } else {
-                char *buf = luby_dup_string(C->L, s + start, len);
+                char *buf = luby_gc_alloc_string(C->L, s + start, len);
                 if (!buf) return 0;
                 v.type = LUBY_T_STRING;
                 v.as.ptr = buf;
@@ -4563,9 +5290,8 @@ static int luby_compile_literal(luby_compiler *C, luby_ast_node *node) {
 
 static luby_proc *luby_compile_block_proc(luby_compiler *C, luby_ast_node *lambda) {
     if (!lambda || lambda->kind != LUBY_AST_LAMBDA) return NULL;
-    luby_proc *proc = (luby_proc *)luby_alloc_raw(C->L, NULL, sizeof(luby_proc));
+    luby_proc *proc = (luby_proc *)luby_gc_alloc(C->L, sizeof(luby_proc), LUBY_GC_PROC);
     if (!proc) return NULL;
-    memset(proc, 0, sizeof(*proc));
     proc->owned_by_chunk = 1;
     proc->splat_index = -1;
 
@@ -4761,9 +5487,8 @@ static void luby_collect_locals(luby_state *L, luby_ast_node *node,
 
 static luby_proc *luby_compile_def_proc(luby_compiler *C, luby_ast_node *defn) {
     if (!defn || defn->kind != LUBY_AST_DEF) return NULL;
-    luby_proc *proc = (luby_proc *)luby_alloc_raw(C->L, NULL, sizeof(luby_proc));
+    luby_proc *proc = (luby_proc *)luby_gc_alloc(C->L, sizeof(luby_proc), LUBY_GC_PROC);
     if (!proc) return NULL;
-    memset(proc, 0, sizeof(*proc));
     proc->owned_by_chunk = 0;
     proc->splat_index = -1;
 
@@ -4863,9 +5588,7 @@ static int luby_compile_call(luby_compiler *C, luby_ast_node *node) {
         if (!luby_compile_node(C, node->as.call.args[i])) return 0;
         argc++;
     }
-    luby_value sym = luby_nil();
-    sym.type = LUBY_T_SYMBOL;
-    sym.as.ptr = luby_dup_string(C->L, node->as.call.method.data, node->as.call.method.length);
+    luby_value sym = luby_symbol(C->L, node->as.call.method.data, node->as.call.method.length);
     uint32_t midx = luby_chunk_add_const(C->L, C->chunk, sym);
     luby_chunk_emit(C->L, C->chunk, node->as.call.safe ? LUBY_OP_SAFE_CALL : LUBY_OP_CALL, (uint8_t)argc, 0, midx, node->line);
     return 1;
@@ -4893,17 +5616,13 @@ static int luby_compile_node(luby_compiler *C, luby_ast_node *node) {
             return 1;
         }
         case LUBY_AST_IDENT: {
-            luby_value sym = luby_nil();
-            sym.type = LUBY_T_SYMBOL;
-            sym.as.ptr = luby_dup_string(C->L, node->as.literal.data, node->as.literal.length);
+            luby_value sym = luby_symbol(C->L, node->as.literal.data, node->as.literal.length);
             uint32_t idx = luby_chunk_add_const(C->L, C->chunk, sym);
             luby_chunk_emit(C->L, C->chunk, LUBY_OP_GET_GLOBAL, 0, 0, idx, node->line);
             return 1;
         }
         case LUBY_AST_CONST: {
-            luby_value sym = luby_nil();
-            sym.type = LUBY_T_SYMBOL;
-            sym.as.ptr = luby_dup_string(C->L, node->as.literal.data, node->as.literal.length);
+            luby_value sym = luby_symbol(C->L, node->as.literal.data, node->as.literal.length);
             uint32_t idx = luby_chunk_add_const(C->L, C->chunk, sym);
             luby_chunk_emit(C->L, C->chunk, LUBY_OP_GET_GLOBAL, 0, 0, idx, node->line);
             return 1;
@@ -4946,9 +5665,7 @@ static int luby_compile_node(luby_compiler *C, luby_ast_node *node) {
         }
         case LUBY_AST_ASSIGN: {
             if (!luby_compile_node(C, node->as.assign.value)) return 0;
-            luby_value sym = luby_nil();
-            sym.type = LUBY_T_SYMBOL;
-            sym.as.ptr = luby_dup_string(C->L, node->as.assign.target->as.literal.data, node->as.assign.target->as.literal.length);
+            luby_value sym = luby_symbol(C->L, node->as.assign.target->as.literal.data, node->as.assign.target->as.literal.length);
             uint32_t idx = luby_chunk_add_const(C->L, C->chunk, sym);
             luby_chunk_emit(C->L, C->chunk, LUBY_OP_SET_GLOBAL, 0, 0, idx, node->line);
             return 1;
@@ -4970,16 +5687,12 @@ static int luby_compile_node(luby_compiler *C, luby_ast_node *node) {
             for (size_t i = tc; i > 0; i--) {
                 luby_ast_node *target = node->as.multi_assign.targets[i - 1];
                 if (target->kind == LUBY_AST_IDENT) {
-                    luby_value sym = luby_nil();
-                    sym.type = LUBY_T_SYMBOL;
-                    sym.as.ptr = luby_dup_string(C->L, target->as.literal.data, target->as.literal.length);
+                    luby_value sym = luby_symbol(C->L, target->as.literal.data, target->as.literal.length);
                     uint32_t idx = luby_chunk_add_const(C->L, C->chunk, sym);
                     luby_chunk_emit(C->L, C->chunk, LUBY_OP_SET_GLOBAL, 0, 0, idx, node->line);
                     luby_chunk_emit(C->L, C->chunk, LUBY_OP_POP, 0, 0, 0, node->line);
                 } else if (target->kind == LUBY_AST_IVAR) {
-                    luby_value sym = luby_nil();
-                    sym.type = LUBY_T_SYMBOL;
-                    sym.as.ptr = luby_dup_string(C->L, target->as.literal.data, target->as.literal.length);
+                    luby_value sym = luby_symbol(C->L, target->as.literal.data, target->as.literal.length);
                     uint32_t idx = luby_chunk_add_const(C->L, C->chunk, sym);
                     luby_chunk_emit(C->L, C->chunk, LUBY_OP_SET_IVAR, 0, 0, idx, node->line);
                     luby_chunk_emit(C->L, C->chunk, LUBY_OP_POP, 0, 0, 0, node->line);
@@ -4994,9 +5707,7 @@ static int luby_compile_node(luby_compiler *C, luby_ast_node *node) {
         }
         case LUBY_AST_IVAR: {
             // Get instance variable
-            luby_value sym = luby_nil();
-            sym.type = LUBY_T_SYMBOL;
-            sym.as.ptr = luby_dup_string(C->L, node->as.literal.data, node->as.literal.length);
+            luby_value sym = luby_symbol(C->L, node->as.literal.data, node->as.literal.length);
             uint32_t idx = luby_chunk_add_const(C->L, C->chunk, sym);
             luby_chunk_emit(C->L, C->chunk, LUBY_OP_GET_IVAR, 0, 0, idx, node->line);
             return 1;
@@ -5004,9 +5715,7 @@ static int luby_compile_node(luby_compiler *C, luby_ast_node *node) {
         case LUBY_AST_IVAR_ASSIGN: {
             // Set instance variable
             if (!luby_compile_node(C, node->as.assign.value)) return 0;
-            luby_value sym = luby_nil();
-            sym.type = LUBY_T_SYMBOL;
-            sym.as.ptr = luby_dup_string(C->L, node->as.assign.target->as.literal.data, node->as.assign.target->as.literal.length);
+            luby_value sym = luby_symbol(C->L, node->as.assign.target->as.literal.data, node->as.assign.target->as.literal.length);
             uint32_t idx = luby_chunk_add_const(C->L, C->chunk, sym);
             luby_chunk_emit(C->L, C->chunk, LUBY_OP_SET_IVAR, 0, 0, idx, node->line);
             return 1;
@@ -5088,9 +5797,7 @@ static int luby_compile_node(luby_compiler *C, luby_ast_node *node) {
             pv.as.ptr = proc;
             uint32_t pidx = luby_chunk_add_const(C->L, C->chunk, pv);
             luby_chunk_emit(C->L, C->chunk, LUBY_OP_CONST, 0, 0, pidx, node->line);
-            luby_value sym = luby_nil();
-            sym.type = LUBY_T_SYMBOL;
-            sym.as.ptr = luby_dup_string(C->L, node->as.defn.name.data, node->as.defn.name.length);
+            luby_value sym = luby_symbol(C->L, node->as.defn.name.data, node->as.defn.name.length);
             uint32_t sidx = luby_chunk_add_const(C->L, C->chunk, sym);
             
             if (node->as.defn.receiver) {
@@ -5105,21 +5812,15 @@ static int luby_compile_node(luby_compiler *C, luby_ast_node *node) {
             return 1;
         }
         case LUBY_AST_CLASS: {
-            luby_value namev = luby_nil();
-            namev.type = LUBY_T_SYMBOL;
-            namev.as.ptr = luby_dup_string(C->L, node->as.class_decl.name.data, node->as.class_decl.name.length);
+            luby_value namev = luby_symbol(C->L, node->as.class_decl.name.data, node->as.class_decl.name.length);
             uint32_t nidx = luby_chunk_add_const(C->L, C->chunk, namev);
             uint16_t sidx = (uint16_t)0xFFFF;
             if (node->as.class_decl.super_name.data && node->as.class_decl.super_name.length > 0) {
-                luby_value sv = luby_nil();
-                sv.type = LUBY_T_SYMBOL;
-                sv.as.ptr = luby_dup_string(C->L, node->as.class_decl.super_name.data, node->as.class_decl.super_name.length);
+                luby_value sv = luby_symbol(C->L, node->as.class_decl.super_name.data, node->as.class_decl.super_name.length);
                 sidx = (uint16_t)luby_chunk_add_const(C->L, C->chunk, sv);
             }
             // Add "self" symbol for setting self inside class body
-            luby_value selfsym = luby_nil();
-            selfsym.type = LUBY_T_SYMBOL;
-            selfsym.as.ptr = luby_dup_string(C->L, "self", 4);
+            luby_value selfsym = luby_symbol(C->L, "self", 4);
             uint32_t selfidx = luby_chunk_add_const(C->L, C->chunk, selfsym);
             
             luby_chunk_emit(C->L, C->chunk, LUBY_OP_GET_CLASS, 0, 0, 0, node->line);
@@ -5139,9 +5840,7 @@ static int luby_compile_node(luby_compiler *C, luby_ast_node *node) {
             return 1;
         }
         case LUBY_AST_MODULE: {
-            luby_value namev = luby_nil();
-            namev.type = LUBY_T_SYMBOL;
-            namev.as.ptr = luby_dup_string(C->L, node->as.module_decl.name.data, node->as.module_decl.name.length);
+            luby_value namev = luby_symbol(C->L, node->as.module_decl.name.data, node->as.module_decl.name.length);
             uint32_t nidx = luby_chunk_add_const(C->L, C->chunk, namev);
             luby_chunk_emit(C->L, C->chunk, LUBY_OP_GET_CLASS, 0, 0, 0, node->line);
             luby_chunk_emit(C->L, C->chunk, LUBY_OP_MAKE_MODULE, 0, 0, nidx, node->line);
@@ -5281,11 +5980,24 @@ LUBY_API luby_state *luby_new(const luby_config *cfg) {
     // Initialize RNG with a default seed
     L->rng_state[0] = 0x853c49e6748fea9bULL;
     L->rng_state[1] = 0xda3e39cb94b95bdbULL;
+    // Initialize GC
+    L->gc_threshold = LUBY_GC_INITIAL_THRESHOLD;
     return L;
 }
 
 LUBY_API void luby_free(luby_state *L) {
     if (!L) return;
+    // Free all GC-tracked objects (mark nothing, sweep everything)
+    L->gc_paused = 1;
+    luby_gc_obj *obj = L->gc_objects;
+    while (obj) {
+        luby_gc_obj *next = obj->gc_next;
+        luby_gc_free_obj(L, obj);
+        obj = next;
+    }
+    L->gc_objects = NULL;
+    L->gc_total = 0;
+    // Free bookkeeping arrays
     for (size_t i = 0; i < L->global_count; i++) {
         luby_alloc_raw(L, (void *)L->global_names[i].data, 0);
     }
@@ -5392,6 +6104,7 @@ LUBY_API int luby_eval(luby_state *L, const char *code, size_t len, const char *
     luby_error err = {0};
     luby_ast_node *ast = luby_parse(L, code, len, filename, &err);
     if (err.code != LUBY_E_OK || !ast) {
+        luby_free_ast(L, ast);
         luby_set_error(L, err.code, err.message ? err.message : "parse error", err.file, err.line, err.column);
         return (int)err.code;
     }
@@ -5403,22 +6116,18 @@ LUBY_API int luby_eval(luby_state *L, const char *code, size_t len, const char *
     C.class_depth = (L->current_class.type == LUBY_T_CLASS || L->current_class.type == LUBY_T_MODULE) ? 1 : 0;
     C.loop_depth = 0;
     if (!luby_compile_node(&C, ast)) {
+        luby_free_ast(L, ast);
         luby_chunk_free(L, &chunk);
         luby_set_error(L, LUBY_E_PARSE, "compile error", filename, 0, 0);
         return (int)LUBY_E_PARSE;
     }
+    luby_free_ast(L, ast);
     luby_value result = luby_nil();
     int rc = luby_execute_chunk(L, &chunk, &result, filename);
 
-    // Copy result if it's a string/symbol, since chunk will be freed
+    // Result strings are GC-tracked, so they remain valid after chunk_free
     if (out) {
-        if (result.type == LUBY_T_STRING || result.type == LUBY_T_SYMBOL) {
-            const char *s = result.as.ptr ? (const char *)result.as.ptr : "";
-            out->type = result.type;
-            out->as.ptr = luby_dup_string(L, s, strlen(s));
-        } else {
-            *out = result;
-        }
+        *out = result;
     }
 
     luby_chunk_free(L, &chunk);
@@ -5619,7 +6328,7 @@ LUBY_API luby_value luby_string(luby_state *L, const char *s, size_t len) {
     luby_value v; v.type = LUBY_T_STRING;
     if (!s) { v.as.ptr = NULL; return v; }
     if (len == 0) len = strlen(s);
-    v.as.ptr = luby_dup_string(L, s, len);
+    v.as.ptr = luby_gc_alloc_string(L, s, len);
     return v;
 }
 LUBY_API luby_value luby_symbol(luby_state *L, const char *s, size_t len) {
@@ -5642,7 +6351,7 @@ LUBY_API luby_value luby_get_global_value(luby_state *L, const char *name) {
 }
 
 LUBY_API luby_value luby_array_new(luby_state *L) {
-    luby_array *arr = (luby_array *)luby_alloc_raw(L, NULL, sizeof(luby_array));
+    luby_array *arr = (luby_array *)luby_gc_alloc(L, sizeof(luby_array), LUBY_GC_ARRAY);
     if (!arr) return luby_nil();
     arr->count = 0;
     arr->capacity = 0;
@@ -5688,7 +6397,7 @@ LUBY_API int luby_array_push_value(luby_state *L, luby_value arr, luby_value v) 
 }
 
 LUBY_API luby_value luby_hash_new(luby_state *L) {
-    luby_hash *h = (luby_hash *)luby_alloc_raw(L, NULL, sizeof(luby_hash));
+    luby_hash *h = (luby_hash *)luby_gc_alloc(L, sizeof(luby_hash), LUBY_GC_HASH);
     if (!h) return luby_nil();
     h->count = 0;
     h->capacity = 0;
@@ -5754,11 +6463,13 @@ LUBY_API int luby_invoke_global(luby_state *L, const char *name, int argc, const
         
         if (!luby_vm_push_frame(L, &vm, proc, &proc->chunk, name, luby_nil(), NULL, name, argc, argv, luby_nil(), 0)) {
             L->current_vm = saved_vm;
+            luby_vm_free(L, &vm);
             return (int)LUBY_E_OOM;
         }
         
         int rc = luby_vm_run(L, &vm, out);
         L->current_vm = saved_vm;
+        luby_vm_free(L, &vm);
         return rc;
     }
     
@@ -5802,11 +6513,13 @@ LUBY_API int luby_invoke_method(luby_state *L, luby_value recv, const char *meth
             
             if (!luby_vm_push_frame(L, &vm, m, &m->chunk, method, recv, cls, method, argc, argv, luby_nil(), 1)) {
                 L->current_vm = saved_vm;
+                luby_vm_free(L, &vm);
                 return (int)LUBY_E_OOM;
             }
             
             int rc = luby_vm_run(L, &vm, out);
             L->current_vm = saved_vm;
+            luby_vm_free(L, &vm);
             return rc;
         }
         
@@ -6197,7 +6910,7 @@ static int luby_array_map(luby_state *L, int argc, const luby_value *argv, luby_
     if (!block && !fn) return (int)LUBY_E_TYPE;
 
     luby_array *src = (luby_array *)argv[0].as.ptr;
-    luby_array *dst = (luby_array *)luby_alloc_raw(L, NULL, sizeof(luby_array));
+    luby_array *dst = (luby_array *)luby_gc_alloc(L, sizeof(luby_array), LUBY_GC_ARRAY);
     if (!dst) return (int)LUBY_E_OOM;
     dst->count = 0;
     dst->capacity = src->count;
@@ -6227,7 +6940,7 @@ static int luby_array_select(luby_state *L, int argc, const luby_value *argv, lu
     if (!block && !fn) return (int)LUBY_E_TYPE;
 
     luby_array *src = (luby_array *)argv[0].as.ptr;
-    luby_array *dst = (luby_array *)luby_alloc_raw(L, NULL, sizeof(luby_array));
+    luby_array *dst = (luby_array *)luby_gc_alloc(L, sizeof(luby_array), LUBY_GC_ARRAY);
     if (!dst) return (int)LUBY_E_OOM;
     dst->count = 0;
     dst->capacity = src->count;
@@ -6257,7 +6970,7 @@ static int luby_array_reject(luby_state *L, int argc, const luby_value *argv, lu
     if (!block && !fn) return (int)LUBY_E_TYPE;
 
     luby_array *src = (luby_array *)argv[0].as.ptr;
-    luby_array *dst = (luby_array *)luby_alloc_raw(L, NULL, sizeof(luby_array));
+    luby_array *dst = (luby_array *)luby_gc_alloc(L, sizeof(luby_array), LUBY_GC_ARRAY);
     if (!dst) return (int)LUBY_E_OOM;
     dst->count = 0;
     dst->capacity = src->count;
@@ -6361,7 +7074,7 @@ static int luby_array_each_with_index(luby_state *L, int argc, const luby_value 
 static int luby_array_compact(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
     if (argc < 1 || argv[0].type != LUBY_T_ARRAY || !argv[0].as.ptr) return (int)LUBY_E_TYPE;
     luby_array *src = (luby_array *)argv[0].as.ptr;
-    luby_array *dst = (luby_array *)luby_alloc_raw(L, NULL, sizeof(luby_array));
+    luby_array *dst = (luby_array *)luby_gc_alloc(L, sizeof(luby_array), LUBY_GC_ARRAY);
     if (!dst) return (int)LUBY_E_OOM;
     dst->count = 0;
     dst->capacity = src->count;
@@ -6569,7 +7282,7 @@ static int luby_hash_map(luby_state *L, int argc, const luby_value *argv, luby_v
     luby_proc *block = (L && L->current_block.type == LUBY_T_PROC) ? (luby_proc *)L->current_block.as.ptr : NULL;
     if (!block) return (int)LUBY_E_TYPE;
     luby_hash *h = (luby_hash *)argv[0].as.ptr;
-    luby_array *dst = (luby_array *)luby_alloc_raw(L, NULL, sizeof(luby_array));
+    luby_array *dst = (luby_array *)luby_gc_alloc(L, sizeof(luby_array), LUBY_GC_ARRAY);
     if (!dst) return (int)LUBY_E_OOM;
     dst->count = 0;
     dst->capacity = h->count;
@@ -7354,12 +8067,15 @@ static int luby_str_upcase(luby_state *L, int argc, const luby_value *argv, luby
     if (argc < 1 || argv[0].type != LUBY_T_STRING || !argv[0].as.ptr) return (int)LUBY_E_TYPE;
     const char *src = (const char *)argv[0].as.ptr;
     size_t len = strlen(src);
-    char *dst = (char *)luby_alloc_raw(L, NULL, len + 1);
-    if (!dst) return (int)LUBY_E_OOM;
+    // Pause GC - src points to argv which may not be rooted during alloc
+    int was_paused = L->gc_paused;
+    L->gc_paused = 1;
+    char *dst = luby_gc_alloc_string(L, src, len);
+    if (!dst) { L->gc_paused = was_paused; return (int)LUBY_E_OOM; }
     for (size_t i = 0; i < len; i++) {
         dst[i] = (char)((src[i] >= 'a' && src[i] <= 'z') ? src[i] - 32 : src[i]);
     }
-    dst[len] = '\0';
+    L->gc_paused = was_paused;
     if (out) { out->type = LUBY_T_STRING; out->as.ptr = dst; }
     return (int)LUBY_E_OK;
 }
@@ -7368,12 +8084,15 @@ static int luby_str_downcase(luby_state *L, int argc, const luby_value *argv, lu
     if (argc < 1 || argv[0].type != LUBY_T_STRING || !argv[0].as.ptr) return (int)LUBY_E_TYPE;
     const char *src = (const char *)argv[0].as.ptr;
     size_t len = strlen(src);
-    char *dst = (char *)luby_alloc_raw(L, NULL, len + 1);
-    if (!dst) return (int)LUBY_E_OOM;
+    // Pause GC - src points to argv which may not be rooted during alloc
+    int was_paused = L->gc_paused;
+    L->gc_paused = 1;
+    char *dst = luby_gc_alloc_string(L, src, len);
+    if (!dst) { L->gc_paused = was_paused; return (int)LUBY_E_OOM; }
     for (size_t i = 0; i < len; i++) {
         dst[i] = (char)((src[i] >= 'A' && src[i] <= 'Z') ? src[i] + 32 : src[i]);
     }
-    dst[len] = '\0';
+    L->gc_paused = was_paused;
     if (out) { out->type = LUBY_T_STRING; out->as.ptr = dst; }
     return (int)LUBY_E_OK;
 }
@@ -7384,8 +8103,12 @@ static int luby_str_split(luby_state *L, int argc, const luby_value *argv, luby_
     const char *delim = (argv[1].type == LUBY_T_STRING && argv[1].as.ptr) ? (const char *)argv[1].as.ptr : " ";
     size_t delim_len = strlen(delim);
     
-    luby_array *arr = (luby_array *)luby_alloc_raw(L, NULL, sizeof(luby_array));
-    if (!arr) return (int)LUBY_E_OOM;
+    // Pause GC - src and delim point to argv which may not be rooted
+    int was_paused = L->gc_paused;
+    L->gc_paused = 1;
+    
+    luby_array *arr = (luby_array *)luby_gc_alloc(L, sizeof(luby_array), LUBY_GC_ARRAY);
+    if (!arr) { L->gc_paused = was_paused; return (int)LUBY_E_OOM; }
     arr->count = 0; arr->capacity = 4; arr->frozen = 0;
     arr->items = (luby_value *)luby_alloc_raw(L, NULL, arr->capacity * sizeof(luby_value));
     
@@ -7393,9 +8116,7 @@ static int luby_str_split(luby_state *L, int argc, const luby_value *argv, luby_
     while (*p) {
         const char *found = delim_len > 0 ? strstr(p, delim) : NULL;
         size_t part_len = found ? (size_t)(found - p) : strlen(p);
-        char *part = (char *)luby_alloc_raw(L, NULL, part_len + 1);
-        memcpy(part, p, part_len);
-        part[part_len] = '\0';
+        char *part = luby_gc_alloc_string(L, p, part_len);
         
         if (arr->count >= arr->capacity) {
             arr->capacity *= 2;
@@ -7408,6 +8129,7 @@ static int luby_str_split(luby_state *L, int argc, const luby_value *argv, luby_
         if (!found) break;
         p = found + delim_len;
     }
+    L->gc_paused = was_paused;
     if (out) { out->type = LUBY_T_ARRAY; out->as.ptr = arr; }
     return (int)LUBY_E_OK;
 }
@@ -7425,8 +8147,12 @@ static int luby_str_join(luby_state *L, int argc, const luby_value *argv, luby_v
         if (i > 0) total += sep_len;
     }
     
-    char *result = (char *)luby_alloc_raw(L, NULL, total + 1);
-    if (!result) return (int)LUBY_E_OOM;
+    // Pause GC - arr and sep point to argv which may not be rooted
+    int was_paused = L->gc_paused;
+    L->gc_paused = 1;
+    
+    char *result = luby_gc_alloc_string(L, NULL, total);
+    if (!result) { L->gc_paused = was_paused; return (int)LUBY_E_OOM; }
     char *p = result;
     for (size_t i = 0; i < arr->count; i++) {
         if (i > 0) { memcpy(p, sep, sep_len); p += sep_len; }
@@ -7437,35 +8163,40 @@ static int luby_str_join(luby_state *L, int argc, const luby_value *argv, luby_v
         }
     }
     *p = '\0';
+    L->gc_paused = was_paused;
     if (out) { out->type = LUBY_T_STRING; out->as.ptr = result; }
     return (int)LUBY_E_OK;
 }
 
 static int luby_array_reverse(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
     if (argc < 1 || !argv[0].as.ptr) return (int)LUBY_E_TYPE;
+    // Pause GC - src/argv may not be rooted during allocation
+    int was_paused = L->gc_paused;
+    L->gc_paused = 1;
     /* String reverse */
     if (argv[0].type == LUBY_T_STRING || argv[0].type == LUBY_T_SYMBOL) {
         const char *src = (const char *)argv[0].as.ptr;
         size_t slen = strlen(src);
-        char *dst = (char *)luby_alloc_raw(L, NULL, slen + 1);
-        if (!dst) return (int)LUBY_E_OOM;
+        char *dst = luby_gc_alloc_string(L, NULL, slen);
+        if (!dst) { L->gc_paused = was_paused; return (int)LUBY_E_OOM; }
         for (size_t i = 0; i < slen; i++) {
             dst[i] = src[slen - 1 - i];
         }
-        dst[slen] = '\0';
+        L->gc_paused = was_paused;
         if (out) { out->type = LUBY_T_STRING; out->as.ptr = dst; }
         return (int)LUBY_E_OK;
     }
     /* Array reverse */
-    if (argv[0].type != LUBY_T_ARRAY) return (int)LUBY_E_TYPE;
+    if (argv[0].type != LUBY_T_ARRAY) { L->gc_paused = was_paused; return (int)LUBY_E_TYPE; }
     luby_array *src = (luby_array *)argv[0].as.ptr;
-    luby_array *dst = (luby_array *)luby_alloc_raw(L, NULL, sizeof(luby_array));
-    if (!dst) return (int)LUBY_E_OOM;
+    luby_array *dst = (luby_array *)luby_gc_alloc(L, sizeof(luby_array), LUBY_GC_ARRAY);
+    if (!dst) { L->gc_paused = was_paused; return (int)LUBY_E_OOM; }
     dst->count = src->count; dst->capacity = src->count; dst->frozen = 0;
     dst->items = (luby_value *)luby_alloc_raw(L, NULL, dst->capacity * sizeof(luby_value));
     for (size_t i = 0; i < src->count; i++) {
         dst->items[i] = src->items[src->count - 1 - i];
     }
+    L->gc_paused = was_paused;
     if (out) { out->type = LUBY_T_ARRAY; out->as.ptr = dst; }
     return (int)LUBY_E_OK;
 }
@@ -7489,7 +8220,7 @@ static int luby_array_last(luby_state *L, int argc, const luby_value *argv, luby
 static int luby_array_flatten(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
     if (argc < 1 || argv[0].type != LUBY_T_ARRAY || !argv[0].as.ptr) return (int)LUBY_E_TYPE;
     luby_array *src = (luby_array *)argv[0].as.ptr;
-    luby_array *dst = (luby_array *)luby_alloc_raw(L, NULL, sizeof(luby_array));
+    luby_array *dst = (luby_array *)luby_gc_alloc(L, sizeof(luby_array), LUBY_GC_ARRAY);
     if (!dst) return (int)LUBY_E_OOM;
     dst->count = 0; dst->capacity = src->count * 2; dst->frozen = 0;
     dst->items = (luby_value *)luby_alloc_raw(L, NULL, dst->capacity * sizeof(luby_value));
@@ -7519,7 +8250,7 @@ static int luby_array_flatten(luby_state *L, int argc, const luby_value *argv, l
 static int luby_array_uniq(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
     if (argc < 1 || argv[0].type != LUBY_T_ARRAY || !argv[0].as.ptr) return (int)LUBY_E_TYPE;
     luby_array *src = (luby_array *)argv[0].as.ptr;
-    luby_array *dst = (luby_array *)luby_alloc_raw(L, NULL, sizeof(luby_array));
+    luby_array *dst = (luby_array *)luby_gc_alloc(L, sizeof(luby_array), LUBY_GC_ARRAY);
     if (!dst) return (int)LUBY_E_OOM;
     dst->count = 0; dst->capacity = src->count; dst->frozen = 0;
     dst->items = (luby_value *)luby_alloc_raw(L, NULL, dst->capacity * sizeof(luby_value));
@@ -7538,7 +8269,7 @@ static int luby_array_uniq(luby_state *L, int argc, const luby_value *argv, luby
 static int luby_array_sort(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
     if (argc < 1 || argv[0].type != LUBY_T_ARRAY || !argv[0].as.ptr) return (int)LUBY_E_TYPE;
     luby_array *src = (luby_array *)argv[0].as.ptr;
-    luby_array *dst = (luby_array *)luby_alloc_raw(L, NULL, sizeof(luby_array));
+    luby_array *dst = (luby_array *)luby_gc_alloc(L, sizeof(luby_array), LUBY_GC_ARRAY);
     if (!dst) return (int)LUBY_E_OOM;
     dst->count = src->count; dst->capacity = src->count; dst->frozen = 0;
     dst->items = (luby_value *)luby_alloc_raw(L, NULL, dst->capacity * sizeof(luby_value));
@@ -7569,7 +8300,7 @@ static int luby_array_sort(luby_state *L, int argc, const luby_value *argv, luby
 static int luby_hash_keys(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
     if (argc < 1 || argv[0].type != LUBY_T_HASH || !argv[0].as.ptr) return (int)LUBY_E_TYPE;
     luby_hash *h = (luby_hash *)argv[0].as.ptr;
-    luby_array *arr = (luby_array *)luby_alloc_raw(L, NULL, sizeof(luby_array));
+    luby_array *arr = (luby_array *)luby_gc_alloc(L, sizeof(luby_array), LUBY_GC_ARRAY);
     if (!arr) return (int)LUBY_E_OOM;
     arr->count = h->count; arr->capacity = h->count; arr->frozen = 0;
     arr->items = (luby_value *)luby_alloc_raw(L, NULL, arr->capacity * sizeof(luby_value));
@@ -7583,7 +8314,7 @@ static int luby_hash_keys(luby_state *L, int argc, const luby_value *argv, luby_
 static int luby_hash_values(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
     if (argc < 1 || argv[0].type != LUBY_T_HASH || !argv[0].as.ptr) return (int)LUBY_E_TYPE;
     luby_hash *h = (luby_hash *)argv[0].as.ptr;
-    luby_array *arr = (luby_array *)luby_alloc_raw(L, NULL, sizeof(luby_array));
+    luby_array *arr = (luby_array *)luby_gc_alloc(L, sizeof(luby_array), LUBY_GC_ARRAY);
     if (!arr) return (int)LUBY_E_OOM;
     arr->count = h->count; arr->capacity = h->count; arr->frozen = 0;
     arr->items = (luby_value *)luby_alloc_raw(L, NULL, arr->capacity * sizeof(luby_value));
@@ -8502,7 +9233,7 @@ static int luby_base_concat(luby_state *L, int argc, const luby_value *argv, lub
     if (argc < 2 || argv[0].type != LUBY_T_ARRAY || argv[1].type != LUBY_T_ARRAY) return (int)LUBY_E_TYPE;
     luby_array *a = (luby_array *)argv[0].as.ptr;
     luby_array *b = (luby_array *)argv[1].as.ptr;
-    luby_array *result = (luby_array *)luby_alloc_raw(L, NULL, sizeof(luby_array));
+    luby_array *result = (luby_array *)luby_gc_alloc(L, sizeof(luby_array), LUBY_GC_ARRAY);
     if (!result) return (int)LUBY_E_OOM;
     result->count = a->count + b->count;
     result->capacity = result->count;
@@ -8519,7 +9250,7 @@ static int luby_base_take(luby_state *L, int argc, const luby_value *argv, luby_
     luby_array *arr = (luby_array *)argv[0].as.ptr;
     size_t n = (size_t)argv[1].as.i;
     if (n > arr->count) n = arr->count;
-    luby_array *result = (luby_array *)luby_alloc_raw(L, NULL, sizeof(luby_array));
+    luby_array *result = (luby_array *)luby_gc_alloc(L, sizeof(luby_array), LUBY_GC_ARRAY);
     if (!result) return (int)LUBY_E_OOM;
     result->count = n;
     result->capacity = n > 0 ? n : 1;
@@ -8536,7 +9267,7 @@ static int luby_base_drop(luby_state *L, int argc, const luby_value *argv, luby_
     size_t n = (size_t)argv[1].as.i;
     if (n > arr->count) n = arr->count;
     size_t rem = arr->count - n;
-    luby_array *result = (luby_array *)luby_alloc_raw(L, NULL, sizeof(luby_array));
+    luby_array *result = (luby_array *)luby_gc_alloc(L, sizeof(luby_array), LUBY_GC_ARRAY);
     if (!result) return (int)LUBY_E_OOM;
     result->count = rem;
     result->capacity = rem > 0 ? rem : 1;
@@ -8551,14 +9282,17 @@ static int luby_str_capitalize(luby_state *L, int argc, const luby_value *argv, 
     if (argc < 1 || argv[0].type != LUBY_T_STRING || !argv[0].as.ptr) return (int)LUBY_E_TYPE;
     const char *src = (const char *)argv[0].as.ptr;
     size_t len = strlen(src);
-    char *dst = (char *)luby_alloc_raw(L, NULL, len + 1);
-    if (!dst) return (int)LUBY_E_OOM;
+    // Pause GC - src points to argv which may not be rooted during alloc
+    int was_paused = L->gc_paused;
+    L->gc_paused = 1;
+    char *dst = luby_gc_alloc_string(L, src, len);
+    if (!dst) { L->gc_paused = was_paused; return (int)LUBY_E_OOM; }
     for (size_t i = 0; i < len; i++) {
         if (i == 0 && src[i] >= 'a' && src[i] <= 'z') dst[i] = (char)(src[i] - 32);
         else if (i > 0 && src[i] >= 'A' && src[i] <= 'Z') dst[i] = (char)(src[i] + 32);
         else dst[i] = src[i];
     }
-    dst[len] = '\0';
+    L->gc_paused = was_paused;
     if (out) { out->type = LUBY_T_STRING; out->as.ptr = dst; }
     return (int)LUBY_E_OK;
 }
@@ -8571,10 +9305,12 @@ static int luby_str_strip(luby_state *L, int argc, const luby_value *argv, luby_
     while (start < len && (src[start] == ' ' || src[start] == '\t' || src[start] == '\n' || src[start] == '\r')) start++;
     while (end > start && (src[end-1] == ' ' || src[end-1] == '\t' || src[end-1] == '\n' || src[end-1] == '\r')) end--;
     size_t new_len = end - start;
-    char *dst = (char *)luby_alloc_raw(L, NULL, new_len + 1);
+    // Pause GC - src points to argv which may not be rooted during alloc
+    int was_paused = L->gc_paused;
+    L->gc_paused = 1;
+    char *dst = luby_gc_alloc_string(L, src + start, new_len);
+    L->gc_paused = was_paused;
     if (!dst) return (int)LUBY_E_OOM;
-    memcpy(dst, src + start, new_len);
-    dst[new_len] = '\0';
     if (out) { out->type = LUBY_T_STRING; out->as.ptr = dst; }
     return (int)LUBY_E_OK;
 }
@@ -8844,7 +9580,7 @@ LUBY_API luby_class *luby_define_class(luby_state *L, const char *name, const ch
 
 LUBY_API int luby_define_method(luby_state *L, luby_class *cls, const char *name, luby_cfunc fn) {
     if (!L || !cls || !cls->obj || !name || !fn) return 0;
-    luby_cmethod *cm = (luby_cmethod *)luby_alloc_raw(L, NULL, sizeof(luby_cmethod));
+    luby_cmethod *cm = (luby_cmethod *)luby_gc_alloc(L, sizeof(luby_cmethod), LUBY_GC_CMETHOD);
     if (!cm) return 0;
     cm->fn = fn;
     luby_value key = luby_symbol(L, name, 0);
@@ -8863,7 +9599,7 @@ LUBY_API void *luby_userdata_ptr(luby_value v) { return v.as.ptr; }
 
 LUBY_API luby_coroutine *luby_coroutine_new(luby_state *L, luby_value func) {
     if (!L || func.type != LUBY_T_PROC || !func.as.ptr) return NULL;
-    luby_coroutine *co = (luby_coroutine *)luby_alloc_raw(L, NULL, sizeof(luby_coroutine));
+    luby_coroutine *co = (luby_coroutine *)luby_gc_alloc(L, sizeof(luby_coroutine), LUBY_GC_COROUTINE);
     if (!co) return NULL;
     co->proc = (luby_proc *)func.as.ptr;
     co->done = 0;
