@@ -3,9 +3,19 @@
 ## In Progress
 
 ## Planned
+- [x] String + non-string auto-stringifies and concatenates (`"hello" + 42` → `"hello42"`)
+- [x] Integer/float division and modulo by zero raises `ZeroDivisionError`
+- [x] Inheriting from an undefined class raises `NameError`
+- [x] Implement `__method__`, `__callee__`, and `caller`
+- [ ] Alias `respond_to` to `respond_to?`
+- [ ] Implement `Object#inspect`
+- [ ] Implement `Object#object_id`
+- [ ] Implement `Class#name`, `Class#superclass`, `Class#ancestors`
+- [ ] Implement `Symbol#to_sym`
+- [ ] Implement `String#to_f`
 
 ## Maybe Later
-- [ ] Regex support
+- [p] Regex support (PUNT)
 
 ## Done
 - [x] Garbage collector (mark-and-sweep with intrusive linked list)
@@ -28,7 +38,7 @@
 - [x] `initialize` method called by `new`
 - [x] Range type (`1..10`, `1...10`) with `to_a`, `each`, `include?`, `size`
 - [x] Splat args (`*args`) and keyword args (`name:`, `name: default`)
-- [x] Lambda (`->`) syntax (note: no strict arity distinction from proc yet)
+- [x] Lambda (`->`) syntax (note: no strict arity distinction from proc)
 - [x] String interpolation (`"Hello, #{name}!"`)
 - [x] Enumerator class (basic support for `each_with_index` without block)
 - [x] Symbol-to-proc (`&:method_name`)

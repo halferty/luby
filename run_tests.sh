@@ -90,6 +90,12 @@ run_test "break_value"
 run_test "for_loop"
 run_test "userdata"
 run_test "block_break"
+run_test "fiber"
+run_test "lazy"
+run_test "struct_enum"
+run_test "attr_methods"
+run_test "error_paths"
+run_test "method_name"
 
 # Summary
 echo "=================================="

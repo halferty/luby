@@ -167,6 +167,8 @@ typedef enum luby_token_kind {
     LUBY_TOK_ATTR_ACCESSOR,
     LUBY_TOK_FILE,       // __FILE__
     LUBY_TOK_LINE,       // __LINE__
+    LUBY_TOK_METHOD_NAME, // __method__
+    LUBY_TOK_CALLEE_NAME, // __callee__
     LUBY_TOK_PRIVATE,
     LUBY_TOK_PUBLIC,
     LUBY_TOK_PROTECTED,
@@ -296,7 +298,8 @@ typedef enum luby_ast_kind {
     LUBY_AST_CVAR_ASSIGN,     // @@x = value
     LUBY_AST_INDEX_ASSIGN,
     LUBY_AST_BINARY,
-    LUBY_AST_UNARY
+    LUBY_AST_UNARY,
+    LUBY_AST_METHOD_NAME   // __method__ / __callee__
 } luby_ast_kind;
 
 // ------------------------------ Arena Allocator ----------------------------
@@ -425,7 +428,8 @@ typedef enum luby_op {
     LUBY_OP_MAKE_RANGE,   // create range from stack (a=exclusive flag)
     LUBY_OP_MULTI_UNPACK, // unpack for multi-assign (a=target_count, b=value_count)
     LUBY_OP_DUP,          // duplicate top of stack
-    LUBY_OP_BLOCK_BREAK   // break from a block iterator (value on stack)
+    LUBY_OP_BLOCK_BREAK,  // break from a block iterator (value on stack)
+    LUBY_OP_GET_METHOD_NAME // push current method name as symbol
 } luby_op;
 
 typedef struct luby_inst {
@@ -2146,6 +2150,8 @@ static luby_token luby_lexer_next(luby_lexer *lex) {
         LUBY_KW("attr_accessor", LUBY_TOK_ATTR_ACCESSOR);
         LUBY_KW("__FILE__", LUBY_TOK_FILE);
         LUBY_KW("__LINE__", LUBY_TOK_LINE);
+        LUBY_KW("__method__", LUBY_TOK_METHOD_NAME);
+        LUBY_KW("__callee__", LUBY_TOK_CALLEE_NAME);
         LUBY_KW("private", LUBY_TOK_PRIVATE);
         LUBY_KW("public", LUBY_TOK_PUBLIC);
         LUBY_KW("protected", LUBY_TOK_PROTECTED);
@@ -3012,6 +3018,12 @@ static luby_ast_node *luby_parse_primary(luby_state *L, luby_parser *p) {
                     node->as.literal.length = strlen(buf);
                 }
             }
+            return node;
+        }
+        case LUBY_TOK_METHOD_NAME:
+        case LUBY_TOK_CALLEE_NAME: {
+            luby_parser_advance(p);
+            luby_ast_node *node = luby_new_node(L, LUBY_AST_METHOD_NAME, tok.line, tok.column);
             return node;
         }
         case LUBY_TOK_IDENTIFIER: {
@@ -5037,7 +5049,14 @@ static int luby_vm_run(luby_state *L, luby_vm *vm, luby_value *out) {
                         if (sname) {
                             luby_string_view sv = { sname, strlen(sname) };
                             luby_value gv = luby_get_global(L, sv);
-                            if (gv.type == LUBY_T_CLASS) super = (luby_class_obj *)gv.as.ptr;
+                            if (gv.type == LUBY_T_CLASS) {
+                                super = (luby_class_obj *)gv.as.ptr;
+                            } else {
+                                char errbuf[256];
+                                snprintf(errbuf, sizeof(errbuf), "NameError: uninitialized constant %s", sname);
+                                luby_set_error(L, LUBY_E_NAME, errbuf, f->filename, line, 0);
+                                goto vm_error;
+                            }
                         }
                     }
                     luby_class_obj *cls = luby_class_new(L, name, super);
@@ -5172,18 +5191,31 @@ static int luby_vm_run(luby_state *L, luby_vm *vm, luby_value *out) {
                     if (vm->sp - f->stack_base < 2) { luby_set_error(L, LUBY_E_RUNTIME, "stack underflow", f->filename, line, 0); goto vm_error; }
                     luby_value b = vm->stack[--vm->sp];
                     luby_value a = vm->stack[--vm->sp];
-                    if (inst.op == LUBY_OP_ADD && a.type == LUBY_T_STRING && b.type == LUBY_T_STRING) {
-                        const char *sa = a.as.ptr ? (const char *)a.as.ptr : "";
-                        const char *sb = b.as.ptr ? (const char *)b.as.ptr : "";
-                        size_t la = strlen(sa), lb = strlen(sb);
-                        // Pause GC - a and b are popped, allocation could free them
+                    if (inst.op == LUBY_OP_ADD && (a.type == LUBY_T_STRING || b.type == LUBY_T_STRING)
+                        && (a.type == LUBY_T_STRING || a.type == LUBY_T_INT || a.type == LUBY_T_FLOAT
+                            || a.type == LUBY_T_BOOL || a.type == LUBY_T_NIL || a.type == LUBY_T_SYMBOL)
+                        && (b.type == LUBY_T_STRING || b.type == LUBY_T_INT || b.type == LUBY_T_FLOAT
+                            || b.type == LUBY_T_BOOL || b.type == LUBY_T_NIL || b.type == LUBY_T_SYMBOL)) {
+                        // String + other (or other + String): auto-stringify and concatenate
                         int was_paused = L->gc_paused;
                         L->gc_paused = 1;
+                        char *sa_tmp = (a.type != LUBY_T_STRING) ? luby_value_to_string(L, a) : NULL;
+                        char *sb_tmp = (b.type != LUBY_T_STRING) ? luby_value_to_string(L, b) : NULL;
+                        const char *sa = sa_tmp ? sa_tmp : (a.as.ptr ? (const char *)a.as.ptr : "");
+                        const char *sb = sb_tmp ? sb_tmp : (b.as.ptr ? (const char *)b.as.ptr : "");
+                        size_t la = strlen(sa), lb = strlen(sb);
                         char *buf = luby_gc_alloc_string(L, NULL, la + lb);
-                        if (!buf) { L->gc_paused = was_paused; luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
+                        if (!buf) {
+                            if (sa_tmp) luby_alloc_raw(L, sa_tmp, 0);
+                            if (sb_tmp) luby_alloc_raw(L, sb_tmp, 0);
+                            L->gc_paused = was_paused;
+                            luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error;
+                        }
                         memcpy(buf, sa, la);
                         memcpy(buf + la, sb, lb);
                         buf[la + lb] = '\0';
+                        if (sa_tmp) luby_alloc_raw(L, sa_tmp, 0);
+                        if (sb_tmp) luby_alloc_raw(L, sb_tmp, 0);
                         L->gc_paused = was_paused;
                         luby_value sv; sv.type = LUBY_T_STRING; sv.as.ptr = buf;
                         vm->stack[vm->sp++] = sv;
@@ -5208,8 +5240,14 @@ static int luby_vm_run(luby_state *L, luby_vm *vm, luby_value *out) {
                         if (inst.op == LUBY_OP_ADD) r = a.as.i + b.as.i;
                         else if (inst.op == LUBY_OP_SUB) r = a.as.i - b.as.i;
                         else if (inst.op == LUBY_OP_MUL) r = a.as.i * b.as.i;
-                        else if (inst.op == LUBY_OP_DIV) r = b.as.i ? a.as.i / b.as.i : 0;
-                        else r = b.as.i ? a.as.i % b.as.i : 0;
+                        else if (inst.op == LUBY_OP_DIV) {
+                            if (b.as.i == 0) { luby_set_error(L, LUBY_E_RUNTIME, "ZeroDivisionError: divided by 0", f->filename, line, 0); goto vm_error; }
+                            r = a.as.i / b.as.i;
+                        }
+                        else {
+                            if (b.as.i == 0) { luby_set_error(L, LUBY_E_RUNTIME, "ZeroDivisionError: divided by 0", f->filename, line, 0); goto vm_error; }
+                            r = a.as.i % b.as.i;
+                        }
                         vm->stack[vm->sp++] = luby_int(r);
                     } else {
                         double af = (a.type == LUBY_T_FLOAT) ? a.as.f : (double)a.as.i;
@@ -5218,8 +5256,14 @@ static int luby_vm_run(luby_state *L, luby_vm *vm, luby_value *out) {
                         if (inst.op == LUBY_OP_ADD) r = af + bf;
                         else if (inst.op == LUBY_OP_SUB) r = af - bf;
                         else if (inst.op == LUBY_OP_MUL) r = af * bf;
-                        else if (inst.op == LUBY_OP_DIV) r = bf != 0.0 ? af / bf : 0.0;
-                        else r = bf != 0.0 ? fmod(af, bf) : 0.0;
+                        else if (inst.op == LUBY_OP_DIV) {
+                            if (bf == 0.0) { luby_set_error(L, LUBY_E_RUNTIME, "ZeroDivisionError: divided by 0", f->filename, line, 0); goto vm_error; }
+                            r = af / bf;
+                        }
+                        else {
+                            if (bf == 0.0) { luby_set_error(L, LUBY_E_RUNTIME, "ZeroDivisionError: divided by 0", f->filename, line, 0); goto vm_error; }
+                            r = fmod(af, bf);
+                        }
                         vm->stack[vm->sp++] = luby_float(r);
                     }
                     break;
@@ -5707,7 +5751,7 @@ set_index_done:
                             luby_value block = L->current_block;
                             L->current_block = L->saved_block_for_call;
                             f->ip++;
-                            if (!luby_vm_push_frame(L, vm, gp, &gp->chunk, "<proc>", luby_nil(), NULL, NULL, use, args, block, 0)) {
+                            if (!luby_vm_push_frame(L, vm, gp, &gp->chunk, "<proc>", luby_nil(), NULL, fname, use, args, block, 0)) {
                                 luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0);
                                 goto vm_error;
                             }
@@ -5992,6 +6036,19 @@ set_index_done:
                     if (out) *out = result;
                     L->current_vm = saved_vm;
                     return (int)LUBY_E_BREAK;
+                }
+                case LUBY_OP_GET_METHOD_NAME: {
+                    const char *mname = L->current_method_name;
+                    if (!luby_vm_ensure_stack(L, vm, 1)) { luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
+                    if (mname && mname[0]) {
+                        luby_value sym;
+                        sym.type = LUBY_T_SYMBOL;
+                        sym.as.ptr = (void *)luby_gc_alloc_string(L, mname, strlen(mname));
+                        vm->stack[vm->sp++] = sym;
+                    } else {
+                        vm->stack[vm->sp++] = luby_nil();
+                    }
+                    break;
                 }
                 case LUBY_OP_GET_IVAR: {
                     // Get instance variable from self
@@ -7151,6 +7208,10 @@ static int luby_compile_node(luby_compiler *C, luby_ast_node *node) {
             pv.as.ptr = proc;
             uint32_t pidx = luby_chunk_add_const(C->L, C->chunk, pv);
             luby_chunk_emit(C->L, C->chunk, LUBY_OP_CONST, 0, 0, pidx, node->line);
+            return 1;
+        }
+        case LUBY_AST_METHOD_NAME: {
+            luby_chunk_emit(C->L, C->chunk, LUBY_OP_GET_METHOD_NAME, 0, 0, 0, node->line);
             return 1;
         }
         default:
@@ -9942,6 +10003,32 @@ static int luby_base_yield(luby_state *L, int argc, const luby_value *argv, luby
     return luby_yield(L, argc, argv, out);
 }
 
+static int luby_base_caller(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    (void)argc; (void)argv;
+    luby_value arr = luby_array_new(L);
+    luby_vm *vm = L->current_vm;
+    if (vm) {
+        // Walk frames from top to bottom (skip the very top frame which is
+        // the one executing the current method that called `caller`)
+        for (int i = vm->frame_count - 1; i >= 0; i--) {
+            luby_vm_frame *fr = &vm->frames[i];
+            const char *fn = fr->filename ? fr->filename : "<unknown>";
+            int ln = (fr->chunk && fr->chunk->lines && fr->ip < fr->chunk->count)
+                     ? (int)fr->chunk->lines[fr->ip] : 0;
+            const char *mn = fr->saved_method_name;
+            char buf[256];
+            if (mn && mn[0]) {
+                snprintf(buf, sizeof(buf), "%s:%d:in '%s'", fn, ln, mn);
+            } else {
+                snprintf(buf, sizeof(buf), "%s:%d:in '<main>'", fn, ln);
+            }
+            luby_array_push_value(L, arr, luby_string(L, buf, 0));
+        }
+    }
+    if (out) *out = arr;
+    return (int)LUBY_E_OK;
+}
+
 static int luby_base_send(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
     if (argc < 2) return (int)LUBY_E_TYPE;
     luby_value recv = argv[0];
@@ -12502,6 +12589,7 @@ LUBY_API void luby_open_base(luby_state *L) {
     luby_register_function(L, "lazy_each", luby_lazy_each);
     luby_register_function(L, "lazy_first_n", luby_lazy_first_n);
     luby_register_function(L, "send", luby_base_send);
+    luby_register_function(L, "caller", luby_base_caller);
     luby_register_function(L, "public_send", luby_base_public_send);
     luby_register_function(L, "define_method", luby_base_define_method);
     luby_register_function(L, "define_singleton_method", luby_base_define_singleton_method);
