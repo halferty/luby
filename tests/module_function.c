@@ -70,16 +70,7 @@ static void test_module_function_mode(void) {
 }
 
 static void test_module_function_include(void) {
-    // NOTE: This test is skipped because calling methods without explicit 
-    // receiver from within another method is a known limitation in Luby.
-    // In Ruby, `compute` would resolve to `self.compute`, but Luby currently
-    // doesn't support implicit self method calls.
-    printf("Testing: module_function methods can be called via include (SKIPPED - needs implicit self)\n");
-    tests_passed++;  // Count as passed since module_function itself works
-    return;
-    
-    // Original test code - enable when implicit self is implemented:
-    /*
+    printf("Testing: module_function methods can be called via include\n");
     luby_state *L = luby_new(NULL);
     luby_open_base(L);
     luby_value result;
@@ -101,7 +92,6 @@ static void test_module_function_include(void) {
         assert_int("module_function include", result, 123);
     }
     luby_free(L);
-    */
 }
 
 static void test_module_function_singleton_call(void) {

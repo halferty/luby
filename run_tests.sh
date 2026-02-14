@@ -83,6 +83,13 @@ run_test "range"
 run_test "exceptions"
 run_test "cvar"
 run_test "module_function"
+run_test "implicit_self"
+run_test "heredoc"
+run_test "loop"
+run_test "break_value"
+run_test "for_loop"
+run_test "userdata"
+run_test "block_break"
 
 # Summary
 echo "=================================="

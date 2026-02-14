@@ -125,16 +125,92 @@ The loader function is called the first time a script does `require "math_extras
 
 ---
 
-## Defining Classes & Userdata
+## Defining Classes & Methods
 
 ```c
-luby_class *cls = luby_define_class(L, "Enemy", "Object");
+luby_class *cls = luby_define_class(L, "Enemy", NULL);   // NULL superclass = Object
 luby_define_method(L, cls, "attack", enemy_attack_fn);
-
-// Wrap a C struct as userdata with a destructor
-luby_value ud = luby_new_userdata(L, sizeof(MyStruct), my_finalizer);
-MyStruct *ptr = (MyStruct *)luby_userdata_ptr(ud);
+luby_define_method(L, cls, "hp", enemy_get_hp);
 ```
+
+Methods receive `(luby_state *L, int argc, const luby_value *argv, luby_value *out)`. When called as `enemy.attack(target)`, `argv[0]` is the receiver (`enemy`), `argv[1]` is `target`, and `argc` is 2.
+
+---
+
+## Userdata — Wrapping C Structs
+
+Userdata lets you hand a C pointer to the Ruby world. Methods dispatch through the userdata's assigned class, and the host can **invalidate** a userdata at any time (e.g., when the underlying C object is destroyed).
+
+### Creating Userdata
+
+Two modes:
+
+```c
+// 1. VM-owned: allocates sizeof(Vec3) bytes, GC frees them
+luby_value ud = luby_new_userdata(L, sizeof(Vec3), vec3_finalizer);
+Vec3 *v = (Vec3 *)luby_userdata_ptr(ud);
+v->x = 1; v->y = 2; v->z = 3;
+
+// 2. Wrapped: the host owns the memory, GC will NOT free it
+Vec3 *host_vec = get_from_engine();
+luby_value ud = luby_wrap_userdata(L, host_vec, vec3_finalizer);
+```
+
+The finalizer callback (`void (*)(void *)`) is called exactly once — either when the userdata is explicitly invalidated, or when the GC collects it. Pass `NULL` if no cleanup is needed.
+
+### Assigning a Class
+
+```c
+luby_class *cls = luby_define_class(L, "Vec3", NULL);
+luby_define_method(L, cls, "x", vec3_get_x);
+luby_define_method(L, cls, "length", vec3_length);
+
+luby_set_userdata_class(L, ud, cls);
+```
+
+Once a class is assigned, Ruby code can call methods on the userdata:
+
+```ruby
+v = make_vec3(1, 2, 3)
+puts v.x          # dispatches to vec3_get_x
+puts v.is_a?(Vec3) # true
+puts v.respond_to?(:x) # true
+```
+
+### Invalidation
+
+When the host C object is destroyed (entity killed, resource freed, etc.), invalidate the userdata so Ruby code gets a clean error instead of a dangling pointer:
+
+```c
+luby_invalidate_userdata(ud);
+// Calls the finalizer, sets data pointer to NULL, marks as dead.
+// Any subsequent method call from Ruby will get an error.
+// Double-invalidate is a safe no-op (returns 0).
+```
+
+From C, always check before dereferencing:
+
+```c
+Vec3 *v = (Vec3 *)luby_userdata_ptr(ud);  // returns NULL if dead
+if (!v) { /* handle dead userdata */ }
+```
+
+### Checking Liveness
+
+```c
+int alive = luby_userdata_alive(ud);  // 1 = alive, 0 = dead
+```
+
+### API Summary
+
+| Function | Purpose |
+|----------|---------|
+| `luby_new_userdata(L, size, fin)` | Allocate VM-owned userdata |
+| `luby_wrap_userdata(L, ptr, fin)` | Wrap an external pointer (host-owned) |
+| `luby_userdata_ptr(v)` | Get the data pointer (NULL if dead) |
+| `luby_userdata_alive(v)` | Check if still valid |
+| `luby_invalidate_userdata(v)` | Tombstone: call finalizer, null pointer |
+| `luby_set_userdata_class(L, v, cls)` | Assign a class for method dispatch |
 
 ---
 
@@ -254,5 +330,6 @@ luby_clear_search_paths(L);  // reset
 
 - All allocations go through the configured allocator (default: malloc/realloc/free).
 - Values returned to the host are owned by the VM — do not free them yourself.
-- There is currently **no garbage collector**; heap objects live until `luby_free` is called. Avoid unbounded allocations in long-running states until GC is implemented.
+- Heap objects (strings, arrays, hashes, userdata, etc.) are tracked by the GC. Objects become eligible for collection when no longer reachable from globals, the stack, or the root set.
+- Userdata finalizers are called when the GC collects the userdata, or when you explicitly call `luby_invalidate_userdata`. The finalizer is never called twice.
 - Use the allocator hook to track or cap memory usage if needed.

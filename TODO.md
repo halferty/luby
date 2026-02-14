@@ -3,14 +3,13 @@
 ## In Progress
 
 ## Planned
-- [ ] Regex support
+- [ ] `Struct` class (`Struct.new(:name, :age)`)
 - [ ] `Comparable` and `Enumerable` as includable modules
 - [ ] Lazy enumerator support
-- [ ] Arena allocation for short-lived eval chunks
-- [ ] Weak references for host-owned userdata
 - [ ] Fiber support
-- [ ] Heredoc strings
-- [ ] Implicit self method calls (calling methods without explicit receiver from within methods)
+
+## Maybe Later
+- [ ] Regex support
 
 ## Done
 - [x] Garbage collector (mark-and-sweep with intrusive linked list)
@@ -49,3 +48,17 @@
 - [x] Reflection (`is_a?`, `kind_of?`, `instance_of?`, `respond_to?`, `defined?`)
 - [x] Class variables (`@@var`)
 - [x] `module_function` (makes methods both private instance methods and public singleton methods)
+- [x] Implicit self method calls (calling methods without explicit receiver resolves to `self.method`)
+- [x] Heredoc strings (`<<IDENT`, `<<-IDENT`, `<<"IDENT"`)
+- [x] `case`/`when` expressions
+- [x] `retry` in exception handling
+- [x] `__method__` and `__callee__`
+- [x] `caller` method for stack introspection
+- [x] `loop` keyword (`loop do ... end`)
+- [x] Arena allocation for AST nodes (16KB block-based bump allocator, freed after compilation)
+- [x] Invalidatable userdata (VM-owned or wrapped host pointers, class dispatch, finalizers, tombstone on invalidation)
+- [x] `break`/`next` with values (`break 42`, `break value if cond`)
+- [x] `for` loops (`for x in collection do ... end`) with optional `do` keyword
+- [x] `while`/`until` with optional `do` keyword (`while cond do ... end`)
+- [x] `break`/`next` inside block iterators (`each`, `map`, `select`, `times`, `reduce`, etc.)
+- [x] Lexer fix: integer literal followed by dot-method (`3.times`) no longer misparsed as float

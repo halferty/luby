@@ -2175,7 +2175,7 @@ static luby_token luby_lexer_next(luby_lexer *lex) {
     if (c >= '0' && c <= '9') {
         int is_float = 0;
         while (luby_lexer_peek(lex) >= '0' && luby_lexer_peek(lex) <= '9') luby_lexer_advance(lex);
-        if (luby_lexer_peek(lex) == '.' && luby_lexer_peek_next(lex) >= '0' && luby_lexer_peek_next(lex) <= '9') {
+        if (luby_lexer_peek(lex) == '.' && luby_lexer_peek_next(lex) != '.') {
             is_float = 1;
             luby_lexer_advance(lex);
             while (luby_lexer_peek(lex) >= '0' && luby_lexer_peek(lex) <= '9') luby_lexer_advance(lex);
@@ -7924,9 +7924,9 @@ static int luby_enum_each(luby_state *L, int argc, const luby_value *argv, luby_
                 luby_value args[2];
                 args[0] = arr->items[idx];
                 args[1] = luby_int(idx);
-                LUBY_CALL_BLOCK_OR_BREAK(L, block, 2, args, &res, out, luby_nil());
+                if (luby_call_block(L, block, 2, args, &res) != 0) return (int)LUBY_E_RUNTIME;
             } else {
-                LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &arr->items[idx], &res, out, luby_nil());
+                if (luby_call_block(L, block, 1, &arr->items[idx], &res) != 0) return (int)LUBY_E_RUNTIME;
             }
         }
         luby_enum_set_field(L, obj, "_enum_index", luby_int(idx));
@@ -7942,7 +7942,7 @@ static int luby_enum_each(luby_state *L, int argc, const luby_value *argv, luby_
             args[0] = h->entries[idx].key;
             args[1] = h->entries[idx].value;
             luby_value res = luby_nil();
-            LUBY_CALL_BLOCK_OR_BREAK(L, block, 2, args, &res, out, luby_nil());
+            if (luby_call_block(L, block, 2, args, &res) != 0) return (int)LUBY_E_RUNTIME;
         }
         luby_enum_set_field(L, obj, "_enum_index", luby_int(idx));
         if (out) *out = argv[0];
@@ -8030,7 +8030,7 @@ static int luby_array_map(luby_state *L, int argc, const luby_value *argv, luby_
     for (size_t i = 0; i < src->count; i++) {
         luby_value res = luby_nil();
         if (block) {
-            LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &src->items[i], &res, out, luby_nil());
+            if (luby_call_block(L, block, 1, &src->items[i], &res) != 0) return (int)LUBY_E_RUNTIME;
         } else {
             if (fn(L, 1, &src->items[i], &res) != 0) return (int)LUBY_E_RUNTIME;
         }
@@ -8060,7 +8060,7 @@ static int luby_array_select(luby_state *L, int argc, const luby_value *argv, lu
     for (size_t i = 0; i < src->count; i++) {
         luby_value res = luby_nil();
         if (block) {
-            LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &src->items[i], &res, out, luby_nil());
+            if (luby_call_block(L, block, 1, &src->items[i], &res) != 0) return (int)LUBY_E_RUNTIME;
         } else {
             if (fn(L, 1, &src->items[i], &res) != 0) return (int)LUBY_E_RUNTIME;
         }
@@ -8091,7 +8091,7 @@ static int luby_array_reject(luby_state *L, int argc, const luby_value *argv, lu
     for (size_t i = 0; i < src->count; i++) {
         luby_value res = luby_nil();
         if (block) {
-            LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &src->items[i], &res, out, luby_nil());
+            if (luby_call_block(L, block, 1, &src->items[i], &res) != 0) return (int)LUBY_E_RUNTIME;
         } else {
             if (fn(L, 1, &src->items[i], &res) != 0) return (int)LUBY_E_RUNTIME;
         }
@@ -8122,7 +8122,7 @@ static int luby_range_each(luby_state *L, int argc, const luby_value *argv, luby
     for (int64_t i = start; i <= end; i++) {
         luby_value iv = luby_int(i);
         luby_value res = luby_nil();
-        LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &iv, &res, out, luby_nil());
+        if (luby_call_block(L, block, 1, &iv, &res) != 0) return (int)LUBY_E_RUNTIME;
     }
     if (out) *out = argv[0];
     return (int)LUBY_E_OK;
@@ -8263,7 +8263,7 @@ static int luby_range_step(luby_state *L, int argc, const luby_value *argv, luby
         for (int64_t i = start; i <= end; i += step) {
             luby_value iv = luby_int(i);
             luby_value res = luby_nil();
-            LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &iv, &res, out, luby_nil());
+            if (luby_call_block(L, block, 1, &iv, &res) != 0) return (int)LUBY_E_RUNTIME;
         }
         if (out) *out = argv[0];
     } else {
@@ -8293,7 +8293,7 @@ static int luby_range_reverse_each(luby_state *L, int argc, const luby_value *ar
     for (int64_t i = end; i >= start; i--) {
         luby_value iv = luby_int(i);
         luby_value res = luby_nil();
-        LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &iv, &res, out, luby_nil());
+        if (luby_call_block(L, block, 1, &iv, &res) != 0) return (int)LUBY_E_RUNTIME;
     }
     if (out) *out = argv[0];
     return (int)LUBY_E_OK;
@@ -8310,7 +8310,7 @@ static int luby_range_sum(luby_state *L, int argc, const luby_value *argv, luby_
         for (int64_t i = start; i <= end; i++) {
             luby_value iv = luby_int(i);
             luby_value res = luby_nil();
-            LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &iv, &res, out, luby_nil());
+            if (luby_call_block(L, block, 1, &iv, &res) != 0) return (int)LUBY_E_RUNTIME;
             if (res.type == LUBY_T_INT) sum += res.as.i;
         }
         if (out) *out = luby_int(sum);
@@ -8342,7 +8342,7 @@ static int luby_range_map(luby_state *L, int argc, const luby_value *argv, luby_
     for (int64_t i = start; i <= end; i++) {
         luby_value iv = luby_int(i);
         luby_value res = luby_nil();
-        LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &iv, &res, out, luby_nil());
+        if (luby_call_block(L, block, 1, &iv, &res) != 0) return (int)LUBY_E_RUNTIME;
         arr->items[arr->count++] = res;
     }
     if (out) { out->type = LUBY_T_ARRAY; out->as.ptr = arr; }
@@ -8367,7 +8367,7 @@ static int luby_range_select(luby_state *L, int argc, const luby_value *argv, lu
     for (int64_t i = start; i <= end; i++) {
         luby_value iv = luby_int(i);
         luby_value res = luby_nil();
-        LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &iv, &res, out, luby_nil());
+        if (luby_call_block(L, block, 1, &iv, &res) != 0) return (int)LUBY_E_RUNTIME;
         if (luby_is_truthy(res)) arr->items[arr->count++] = iv;
     }
     if (out) { out->type = LUBY_T_ARRAY; out->as.ptr = arr; }
@@ -8392,7 +8392,7 @@ static int luby_range_reject(luby_state *L, int argc, const luby_value *argv, lu
     for (int64_t i = start; i <= end; i++) {
         luby_value iv = luby_int(i);
         luby_value res = luby_nil();
-        LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &iv, &res, out, luby_nil());
+        if (luby_call_block(L, block, 1, &iv, &res) != 0) return (int)LUBY_E_RUNTIME;
         if (!luby_is_truthy(res)) arr->items[arr->count++] = iv;
     }
     if (out) { out->type = LUBY_T_ARRAY; out->as.ptr = arr; }
@@ -8409,7 +8409,7 @@ static int luby_range_any(luby_state *L, int argc, const luby_value *argv, luby_
     for (int64_t i = start; i <= end; i++) {
         luby_value iv = luby_int(i);
         luby_value res = luby_nil();
-        LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &iv, &res, out, luby_nil());
+        if (luby_call_block(L, block, 1, &iv, &res) != 0) return (int)LUBY_E_RUNTIME;
         if (luby_is_truthy(res)) { if (out) *out = luby_bool(1); return (int)LUBY_E_OK; }
     }
     if (out) *out = luby_bool(0);
@@ -8426,7 +8426,7 @@ static int luby_range_all(luby_state *L, int argc, const luby_value *argv, luby_
     for (int64_t i = start; i <= end; i++) {
         luby_value iv = luby_int(i);
         luby_value res = luby_nil();
-        LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &iv, &res, out, luby_nil());
+        if (luby_call_block(L, block, 1, &iv, &res) != 0) return (int)LUBY_E_RUNTIME;
         if (!luby_is_truthy(res)) { if (out) *out = luby_bool(0); return (int)LUBY_E_OK; }
     }
     if (out) *out = luby_bool(1);
@@ -8443,7 +8443,7 @@ static int luby_range_none(luby_state *L, int argc, const luby_value *argv, luby
     for (int64_t i = start; i <= end; i++) {
         luby_value iv = luby_int(i);
         luby_value res = luby_nil();
-        LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &iv, &res, out, luby_nil());
+        if (luby_call_block(L, block, 1, &iv, &res) != 0) return (int)LUBY_E_RUNTIME;
         if (luby_is_truthy(res)) { if (out) *out = luby_bool(0); return (int)LUBY_E_OK; }
     }
     if (out) *out = luby_bool(1);
@@ -8467,7 +8467,7 @@ static int luby_array_each(luby_state *L, int argc, const luby_value *argv, luby
     for (size_t i = 0; i < src->count; i++) {
         luby_value res = luby_nil();
         if (block) {
-            LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &src->items[i], &res, out, luby_nil());
+            if (luby_call_block(L, block, 1, &src->items[i], &res) != 0) return (int)LUBY_E_RUNTIME;
         } else {
             if (fn(L, 1, &src->items[i], &res) != 0) return (int)LUBY_E_RUNTIME;
         }
@@ -8494,7 +8494,7 @@ static int luby_array_each_with_index(luby_state *L, int argc, const luby_value 
         args[1] = luby_int((int64_t)i);
         luby_value res = luby_nil();
         if (block) {
-            LUBY_CALL_BLOCK_OR_BREAK(L, block, 2, args, &res, out, luby_nil());
+            if (luby_call_block(L, block, 2, args, &res) != 0) return (int)LUBY_E_RUNTIME;
         } else {
             if (fn(L, 2, args, &res) != 0) return (int)LUBY_E_RUNTIME;
         }
@@ -8560,7 +8560,7 @@ static int luby_array_reduce(luby_state *L, int argc, const luby_value *argv, lu
         luby_value args[2];
         args[0] = acc;
         args[1] = src->items[i];
-        LUBY_CALL_BLOCK_OR_BREAK(L, block, 2, args, &acc, out, luby_nil());
+        if (luby_call_block(L, block, 2, args, &acc) != 0) return (int)LUBY_E_RUNTIME;
     }
     if (out) *out = acc;
     return (int)LUBY_E_OK;
@@ -8573,7 +8573,7 @@ static int luby_array_any(luby_state *L, int argc, const luby_value *argv, luby_
     luby_array *src = (luby_array *)argv[0].as.ptr;
     for (size_t i = 0; i < src->count; i++) {
         luby_value res = luby_nil();
-        LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &src->items[i], &res, out, luby_nil());
+        if (luby_call_block(L, block, 1, &src->items[i], &res) != 0) return (int)LUBY_E_RUNTIME;
         if (luby_is_truthy(res)) { if (out) *out = luby_bool(1); return (int)LUBY_E_OK; }
     }
     if (out) *out = luby_bool(0);
@@ -8587,7 +8587,7 @@ static int luby_array_all(luby_state *L, int argc, const luby_value *argv, luby_
     luby_array *src = (luby_array *)argv[0].as.ptr;
     for (size_t i = 0; i < src->count; i++) {
         luby_value res = luby_nil();
-        LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &src->items[i], &res, out, luby_nil());
+        if (luby_call_block(L, block, 1, &src->items[i], &res) != 0) return (int)LUBY_E_RUNTIME;
         if (!luby_is_truthy(res)) { if (out) *out = luby_bool(0); return (int)LUBY_E_OK; }
     }
     if (out) *out = luby_bool(1);
@@ -8601,7 +8601,7 @@ static int luby_array_none(luby_state *L, int argc, const luby_value *argv, luby
     luby_array *src = (luby_array *)argv[0].as.ptr;
     for (size_t i = 0; i < src->count; i++) {
         luby_value res = luby_nil();
-        LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &src->items[i], &res, out, luby_nil());
+        if (luby_call_block(L, block, 1, &src->items[i], &res) != 0) return (int)LUBY_E_RUNTIME;
         if (luby_is_truthy(res)) { if (out) *out = luby_bool(0); return (int)LUBY_E_OK; }
     }
     if (out) *out = luby_bool(1);
@@ -8615,7 +8615,7 @@ static int luby_array_find(luby_state *L, int argc, const luby_value *argv, luby
     luby_array *src = (luby_array *)argv[0].as.ptr;
     for (size_t i = 0; i < src->count; i++) {
         luby_value res = luby_nil();
-        LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &src->items[i], &res, out, luby_nil());
+        if (luby_call_block(L, block, 1, &src->items[i], &res) != 0) return (int)LUBY_E_RUNTIME;
         if (luby_is_truthy(res)) { if (out) *out = src->items[i]; return (int)LUBY_E_OK; }
     }
     if (out) *out = luby_nil();
@@ -8693,7 +8693,7 @@ static int luby_hash_each(luby_state *L, int argc, const luby_value *argv, luby_
         args[0] = h->entries[i].key;
         args[1] = h->entries[i].value;
         luby_value res = luby_nil();
-        LUBY_CALL_BLOCK_OR_BREAK(L, block, 2, args, &res, out, luby_nil());
+        if (luby_call_block(L, block, 2, args, &res) != 0) return (int)LUBY_E_RUNTIME;
     }
     if (out) *out = argv[0];
     return (int)LUBY_E_OK;
@@ -8726,7 +8726,7 @@ static int luby_hash_map(luby_state *L, int argc, const luby_value *argv, luby_v
         args[0] = h->entries[i].key;
         args[1] = h->entries[i].value;
         luby_value res = luby_nil();
-        LUBY_CALL_BLOCK_OR_BREAK(L, block, 2, args, &res, out, luby_nil());
+        if (luby_call_block(L, block, 2, args, &res) != 0) return (int)LUBY_E_RUNTIME;
         dst->items[dst->count++] = res;
     }
     luby_value v; v.type = LUBY_T_ARRAY; v.as.ptr = dst;
@@ -8747,7 +8747,7 @@ static int luby_hash_select(luby_state *L, int argc, const luby_value *argv, lub
         args[0] = h->entries[i].key;
         args[1] = h->entries[i].value;
         luby_value res = luby_nil();
-        LUBY_CALL_BLOCK_OR_BREAK(L, block, 2, args, &res, out, luby_nil());
+        if (luby_call_block(L, block, 2, args, &res) != 0) return (int)LUBY_E_RUNTIME;
         if (luby_is_truthy(res)) {
             luby_hash_set_value(L, (luby_value){ .type = LUBY_T_HASH, .as.ptr = dst }, h->entries[i].key, h->entries[i].value);
         }
@@ -8770,7 +8770,7 @@ static int luby_hash_reject(luby_state *L, int argc, const luby_value *argv, lub
         args[0] = h->entries[i].key;
         args[1] = h->entries[i].value;
         luby_value res = luby_nil();
-        LUBY_CALL_BLOCK_OR_BREAK(L, block, 2, args, &res, out, luby_nil());
+        if (luby_call_block(L, block, 2, args, &res) != 0) return (int)LUBY_E_RUNTIME;
         if (!luby_is_truthy(res)) {
             luby_hash_set_value(L, (luby_value){ .type = LUBY_T_HASH, .as.ptr = dst }, h->entries[i].key, h->entries[i].value);
         }
@@ -8790,7 +8790,7 @@ static int luby_hash_any(luby_state *L, int argc, const luby_value *argv, luby_v
         args[0] = h->entries[i].key;
         args[1] = h->entries[i].value;
         luby_value res = luby_nil();
-        LUBY_CALL_BLOCK_OR_BREAK(L, block, 2, args, &res, out, luby_nil());
+        if (luby_call_block(L, block, 2, args, &res) != 0) return (int)LUBY_E_RUNTIME;
         if (luby_is_truthy(res)) { if (out) *out = luby_bool(1); return (int)LUBY_E_OK; }
     }
     if (out) *out = luby_bool(0);
@@ -8807,7 +8807,7 @@ static int luby_hash_all(luby_state *L, int argc, const luby_value *argv, luby_v
         args[0] = h->entries[i].key;
         args[1] = h->entries[i].value;
         luby_value res = luby_nil();
-        LUBY_CALL_BLOCK_OR_BREAK(L, block, 2, args, &res, out, luby_nil());
+        if (luby_call_block(L, block, 2, args, &res) != 0) return (int)LUBY_E_RUNTIME;
         if (!luby_is_truthy(res)) { if (out) *out = luby_bool(0); return (int)LUBY_E_OK; }
     }
     if (out) *out = luby_bool(1);
@@ -8824,7 +8824,7 @@ static int luby_hash_none(luby_state *L, int argc, const luby_value *argv, luby_
         args[0] = h->entries[i].key;
         args[1] = h->entries[i].value;
         luby_value res = luby_nil();
-        LUBY_CALL_BLOCK_OR_BREAK(L, block, 2, args, &res, out, luby_nil());
+        if (luby_call_block(L, block, 2, args, &res) != 0) return (int)LUBY_E_RUNTIME;
         if (luby_is_truthy(res)) { if (out) *out = luby_bool(0); return (int)LUBY_E_OK; }
     }
     if (out) *out = luby_bool(1);
@@ -8841,7 +8841,7 @@ static int luby_hash_find(luby_state *L, int argc, const luby_value *argv, luby_
         args[0] = h->entries[i].key;
         args[1] = h->entries[i].value;
         luby_value res = luby_nil();
-        LUBY_CALL_BLOCK_OR_BREAK(L, block, 2, args, &res, out, luby_nil());
+        if (luby_call_block(L, block, 2, args, &res) != 0) return (int)LUBY_E_RUNTIME;
         if (luby_is_truthy(res)) { if (out) *out = h->entries[i].key; return (int)LUBY_E_OK; }
     }
     if (out) *out = luby_nil();
@@ -8869,7 +8869,7 @@ static int luby_hash_reduce(luby_state *L, int argc, const luby_value *argv, lub
         args[0] = acc;
         args[1] = h->entries[i].key;
         args[2] = h->entries[i].value;
-        LUBY_CALL_BLOCK_OR_BREAK(L, block, 3, args, &acc, out, luby_nil());
+        if (luby_call_block(L, block, 3, args, &acc) != 0) return (int)LUBY_E_RUNTIME;
     }
     if (out) *out = acc;
     return (int)LUBY_E_OK;
@@ -9061,7 +9061,7 @@ static int luby_hash_each_key(luby_state *L, int argc, const luby_value *argv, l
     luby_hash *h = (luby_hash *)argv[0].as.ptr;
     for (size_t i = 0; i < h->count; i++) {
         luby_value res = luby_nil();
-        LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &h->entries[i].key, &res, out, luby_nil());
+        if (luby_call_block(L, block, 1, &h->entries[i].key, &res) != 0) return (int)LUBY_E_RUNTIME;
     }
     if (out) *out = argv[0];
     return (int)LUBY_E_OK;
@@ -9075,7 +9075,7 @@ static int luby_hash_each_value(luby_state *L, int argc, const luby_value *argv,
     luby_hash *h = (luby_hash *)argv[0].as.ptr;
     for (size_t i = 0; i < h->count; i++) {
         luby_value res = luby_nil();
-        LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &h->entries[i].value, &res, out, luby_nil());
+        if (luby_call_block(L, block, 1, &h->entries[i].value, &res) != 0) return (int)LUBY_E_RUNTIME;
     }
     if (out) *out = argv[0];
     return (int)LUBY_E_OK;
@@ -9974,14 +9974,7 @@ static int luby_array_sort_by(luby_state *L, int argc, const luby_value *argv, l
 
     luby_value *keys = (luby_value *)luby_alloc_raw(L, NULL, n * sizeof(luby_value));
     for (size_t i = 0; i < n; i++) {
-        int _rc = luby_call_block(L, block, 1, &src->items[i], &keys[i]);
-        if (_rc == (int)LUBY_E_BREAK) {
-            luby_alloc_raw(L, keys, 0);
-            if (out) *out = L->block_break_value;
-            L->block_break = 0;
-            return (int)LUBY_E_OK;
-        }
-        if (_rc != 0) {
+        if (luby_call_block(L, block, 1, &src->items[i], &keys[i]) != 0) {
             luby_alloc_raw(L, keys, 0);
             return (int)LUBY_E_RUNTIME;
         }
@@ -10014,11 +10007,11 @@ static int luby_array_min_by(luby_state *L, int argc, const luby_value *argv, lu
 
     luby_value best = src->items[0];
     luby_value best_key;
-    LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &src->items[0], &best_key, out, luby_nil());
+    if (luby_call_block(L, block, 1, &src->items[0], &best_key) != 0) return (int)LUBY_E_RUNTIME;
 
     for (size_t i = 1; i < src->count; i++) {
         luby_value key;
-        LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &src->items[i], &key, out, luby_nil());
+        if (luby_call_block(L, block, 1, &src->items[i], &key) != 0) return (int)LUBY_E_RUNTIME;
         int less = 0;
         if (key.type == LUBY_T_INT && best_key.type == LUBY_T_INT) less = key.as.i < best_key.as.i;
         else if (key.type == LUBY_T_FLOAT && best_key.type == LUBY_T_FLOAT) less = key.as.f < best_key.as.f;
@@ -10039,11 +10032,11 @@ static int luby_array_max_by(luby_state *L, int argc, const luby_value *argv, lu
 
     luby_value best = src->items[0];
     luby_value best_key;
-    LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &src->items[0], &best_key, out, luby_nil());
+    if (luby_call_block(L, block, 1, &src->items[0], &best_key) != 0) return (int)LUBY_E_RUNTIME;
 
     for (size_t i = 1; i < src->count; i++) {
         luby_value key;
-        LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &src->items[i], &key, out, luby_nil());
+        if (luby_call_block(L, block, 1, &src->items[i], &key) != 0) return (int)LUBY_E_RUNTIME;
         int greater = 0;
         if (key.type == LUBY_T_INT && best_key.type == LUBY_T_INT) greater = key.as.i > best_key.as.i;
         else if (key.type == LUBY_T_FLOAT && best_key.type == LUBY_T_FLOAT) greater = key.as.f > best_key.as.f;
@@ -10072,14 +10065,7 @@ static int luby_array_group_by(luby_state *L, int argc, const luby_value *argv, 
 
     for (size_t i = 0; i < src->count; i++) {
         luby_value key;
-        int _rc = luby_call_block(L, block, 1, &src->items[i], &key);
-        if (_rc == (int)LUBY_E_BREAK) {
-            L->gc_paused = was_paused;
-            if (out) *out = L->block_break_value;
-            L->block_break = 0;
-            return (int)LUBY_E_OK;
-        }
-        if (_rc != 0) { L->gc_paused = was_paused; return (int)LUBY_E_RUNTIME; }
+        if (luby_call_block(L, block, 1, &src->items[i], &key) != 0) { L->gc_paused = was_paused; return (int)LUBY_E_RUNTIME; }
 
         // Find or create array for this key
         luby_array *group = NULL;
@@ -10123,7 +10109,7 @@ static int luby_array_flat_map(luby_state *L, int argc, const luby_value *argv, 
 
     for (size_t i = 0; i < src->count; i++) {
         luby_value res;
-        LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &src->items[i], &res, out, luby_nil());
+        if (luby_call_block(L, block, 1, &src->items[i], &res) != 0) return (int)LUBY_E_RUNTIME;
         if (res.type == LUBY_T_ARRAY && res.as.ptr) {
             luby_array *sub = (luby_array *)res.as.ptr;
             for (size_t j = 0; j < sub->count; j++) {
@@ -10160,7 +10146,7 @@ static int luby_array_sum(luby_state *L, int argc, const luby_value *argv, luby_
     for (size_t i = 0; i < src->count; i++) {
         luby_value v = src->items[i];
         if (block) {
-            LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &src->items[i], &v, out, luby_nil());
+            if (luby_call_block(L, block, 1, &src->items[i], &v) != 0) return (int)LUBY_E_RUNTIME;
         }
         if (v.type == LUBY_T_FLOAT) {
             if (!use_float) { fsum = (double)isum; use_float = 1; }
@@ -10193,7 +10179,7 @@ static int luby_array_count(luby_state *L, int argc, const luby_value *argv, lub
     int64_t cnt = 0;
     for (size_t i = 0; i < src->count; i++) {
         luby_value res;
-        LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &src->items[i], &res, out, luby_nil());
+        if (luby_call_block(L, block, 1, &src->items[i], &res) != 0) return (int)LUBY_E_RUNTIME;
         if (luby_is_truthy(res)) cnt++;
     }
     if (out) { out->type = LUBY_T_INT; out->as.i = cnt; }
@@ -10539,7 +10525,7 @@ static int luby_array_map_with_index(luby_state *L, int argc, const luby_value *
     for (size_t i = 0; i < src->count; i++) {
         luby_value args[2]; args[0] = src->items[i]; args[1] = luby_int((int64_t)i);
         luby_value res = luby_nil();
-        LUBY_CALL_BLOCK_OR_BREAK(L, block, 2, args, &res, out, luby_nil());
+        if (luby_call_block(L, block, 2, args, &res) != 0) return (int)LUBY_E_RUNTIME;
         dst->items[dst->count++] = res;
     }
     luby_value v; v.type = LUBY_T_ARRAY; v.as.ptr = dst;
@@ -10557,7 +10543,7 @@ static int luby_array_each_with_object(luby_state *L, int argc, const luby_value
     for (size_t i = 0; i < src->count; i++) {
         luby_value args[2]; args[0] = src->items[i]; args[1] = memo;
         luby_value res = luby_nil();
-        LUBY_CALL_BLOCK_OR_BREAK(L, block, 2, args, &res, out, luby_nil());
+        if (luby_call_block(L, block, 2, args, &res) != 0) return (int)LUBY_E_RUNTIME;
     }
     if (out) *out = memo;
     return (int)LUBY_E_OK;
@@ -10589,7 +10575,7 @@ static int luby_array_each_slice(luby_state *L, int argc, const luby_value *argv
         luby_value sv; sv.type = LUBY_T_ARRAY; sv.as.ptr = slice;
         if (block) {
             luby_value res = luby_nil();
-            LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &sv, &res, out, luby_nil());
+            if (luby_call_block(L, block, 1, &sv, &res) != 0) return (int)LUBY_E_RUNTIME;
         }
         dst->items[dst->count++] = sv;
     }
@@ -10629,7 +10615,7 @@ static int luby_array_each_cons(luby_state *L, int argc, const luby_value *argv,
         luby_value cv; cv.type = LUBY_T_ARRAY; cv.as.ptr = cons;
         if (block) {
             luby_value res = luby_nil();
-            LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &cv, &res, out, luby_nil());
+            if (luby_call_block(L, block, 1, &cv, &res) != 0) return (int)LUBY_E_RUNTIME;
         }
         dst->items[dst->count++] = cv;
     }
@@ -10646,7 +10632,7 @@ static int luby_array_find_index(luby_state *L, int argc, const luby_value *argv
     if (block) {
         for (size_t i = 0; i < src->count; i++) {
             luby_value res = luby_nil();
-            LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &src->items[i], &res, out, luby_nil());
+            if (luby_call_block(L, block, 1, &src->items[i], &res) != 0) return (int)LUBY_E_RUNTIME;
             if (luby_is_truthy(res)) { if (out) *out = luby_int((int64_t)i); return (int)LUBY_E_OK; }
         }
     } else if (argc >= 2) {
@@ -10720,7 +10706,7 @@ static int luby_base_times(luby_state *L, int argc, const luby_value *argv, luby
     for (int64_t i = 0; i < n; i++) {
         luby_value iv = luby_int(i);
         luby_value res = luby_nil();
-        LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &iv, &res, out, luby_nil());
+        if (luby_call_block(L, block, 1, &iv, &res) != 0) return (int)LUBY_E_RUNTIME;
     }
     if (out) *out = argv[0];
     return (int)LUBY_E_OK;
@@ -10736,7 +10722,7 @@ static int luby_base_upto(luby_state *L, int argc, const luby_value *argv, luby_
     for (int64_t i = from; i <= to; i++) {
         luby_value iv = luby_int(i);
         luby_value res = luby_nil();
-        LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &iv, &res, out, luby_nil());
+        if (luby_call_block(L, block, 1, &iv, &res) != 0) return (int)LUBY_E_RUNTIME;
     }
     if (out) *out = argv[0];
     return (int)LUBY_E_OK;
@@ -10752,7 +10738,7 @@ static int luby_base_downto(luby_state *L, int argc, const luby_value *argv, lub
     for (int64_t i = from; i >= to; i--) {
         luby_value iv = luby_int(i);
         luby_value res = luby_nil();
-        LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &iv, &res, out, luby_nil());
+        if (luby_call_block(L, block, 1, &iv, &res) != 0) return (int)LUBY_E_RUNTIME;
     }
     if (out) *out = argv[0];
     return (int)LUBY_E_OK;
