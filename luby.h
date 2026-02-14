@@ -218,7 +218,8 @@ typedef enum luby_token_kind {
     LUBY_TOK_PERCENTEQ,  // %=
     LUBY_TOK_ORASSIGN,   // ||=
     LUBY_TOK_ANDASSIGN,  // &&=
-    LUBY_TOK_ARROW       // ->
+    LUBY_TOK_ARROW,      // ->
+    LUBY_TOK_SPACESHIP   // <=>
 } luby_token_kind;
 
 typedef struct luby_token {
@@ -652,6 +653,7 @@ struct luby_state {
     luby_hook_fn hook;
     void *hook_user;
     luby_value current_block;
+    luby_value saved_block_for_call;
     luby_value current_class;
     luby_value current_self;
     luby_class_obj *current_method_class;
@@ -1139,6 +1141,7 @@ static void luby_gc_mark_roots(luby_state *L) {
     }
     // Current block, class, self
     luby_gc_mark_value(L->current_block);
+    luby_gc_mark_value(L->saved_block_for_call);
     luby_gc_mark_value(L->current_class);
     luby_gc_mark_value(L->current_self);
     if (L->current_method_class) luby_gc_mark_obj(&L->current_method_class->gc);
@@ -2368,6 +2371,7 @@ static luby_token luby_lexer_next(luby_lexer *lex) {
         // Not a valid heredoc, backtrack
         lex->pos = saved_pos;
     }
+    if (c == '<' && luby_lexer_peek(lex) == '=' && luby_lexer_peek_next(lex) == '>') { luby_lexer_advance(lex); luby_lexer_advance(lex); return luby_make_token(LUBY_TOK_SPACESHIP, start, 3, line, column); }
     if (c == '<' && luby_lexer_peek(lex) == '=') { luby_lexer_advance(lex); return luby_make_token(LUBY_TOK_LTE, start, 2, line, column); }
     if (c == '>' && luby_lexer_peek(lex) == '=') { luby_lexer_advance(lex); return luby_make_token(LUBY_TOK_GTE, start, 2, line, column); }
     // Check 3-char ||= and &&= before 2-char || and &&
@@ -2788,7 +2792,8 @@ static int luby_token_precedence(luby_token_kind kind) {
         case LUBY_TOK_LT:
         case LUBY_TOK_LTE:
         case LUBY_TOK_GT:
-        case LUBY_TOK_GTE: return 5;
+        case LUBY_TOK_GTE:
+        case LUBY_TOK_SPACESHIP: return 5;
         case LUBY_TOK_RANGE_INCL:
         case LUBY_TOK_RANGE_EXCL: return 6;  // range operators
         case LUBY_TOK_PIPE:
@@ -3040,17 +3045,7 @@ static luby_ast_node *luby_parse_primary(luby_state *L, luby_parser *p) {
             return node;
         }
         case LUBY_TOK_YIELD: {
-            luby_parser_advance(p);
-            luby_string_view name = { "yield", 5 };
-            luby_ast_node *call = luby_make_call(L, NULL, name, tok.line, tok.column);
-            if (!call) return NULL;
-            if (luby_parser_match(p, LUBY_TOK_LPAREN)) {
-                luby_parse_call_args(L, p, call);
-                if (!luby_parser_match(p, LUBY_TOK_RPAREN)) {
-                    luby_parser_error(p, "expected ')'");
-                }
-            }
-            return call;
+            return luby_parse_keyword_call(L, p, "yield", 5);
         }
         case LUBY_TOK_SUPER: {
             luby_parser_advance(p);
@@ -3066,30 +3061,10 @@ static luby_ast_node *luby_parse_primary(luby_state *L, luby_parser *p) {
             return call;
         }
         case LUBY_TOK_REQUIRE: {
-            luby_parser_advance(p);
-            luby_string_view name = { "require", 7 };
-            luby_ast_node *call = luby_make_call(L, NULL, name, tok.line, tok.column);
-            if (!call) return NULL;
-            if (luby_parser_match(p, LUBY_TOK_LPAREN)) {
-                luby_parse_call_args(L, p, call);
-                if (!luby_parser_match(p, LUBY_TOK_RPAREN)) {
-                    luby_parser_error(p, "expected ')'");
-                }
-            }
-            return call;
+            return luby_parse_keyword_call(L, p, "require", 7);
         }
         case LUBY_TOK_LOAD: {
-            luby_parser_advance(p);
-            luby_string_view name = { "load", 4 };
-            luby_ast_node *call = luby_make_call(L, NULL, name, tok.line, tok.column);
-            if (!call) return NULL;
-            if (luby_parser_match(p, LUBY_TOK_LPAREN)) {
-                luby_parse_call_args(L, p, call);
-                if (!luby_parser_match(p, LUBY_TOK_RPAREN)) {
-                    luby_parser_error(p, "expected ')'");
-                }
-            }
-            return call;
+            return luby_parse_keyword_call(L, p, "load", 4);
         }
         case LUBY_TOK_RAISE: {
             return luby_parse_keyword_call(L, p, "raise", 5);
@@ -3636,12 +3611,30 @@ static luby_ast_node *luby_parse_params(luby_state *L, luby_parser *p) {
 static luby_ast_node *luby_parse_def(luby_state *L, luby_parser *p) {
     luby_token def_tok = p->current;
     luby_parser_advance(p);
-    if (!luby_token_is_name(p->current.kind) && p->current.kind != LUBY_TOK_SELF) {
+    // Allow operator method names like <=>
+    if (!luby_token_is_name(p->current.kind) && p->current.kind != LUBY_TOK_SELF && p->current.kind != LUBY_TOK_SPACESHIP && p->current.kind != LUBY_TOK_EQEQ && p->current.kind != LUBY_TOK_LT && p->current.kind != LUBY_TOK_GT && p->current.kind != LUBY_TOK_LTE && p->current.kind != LUBY_TOK_GTE && p->current.kind != LUBY_TOK_PLUS && p->current.kind != LUBY_TOK_MINUS && p->current.kind != LUBY_TOK_STAR && p->current.kind != LUBY_TOK_SLASH && p->current.kind != LUBY_TOK_PERCENT && p->current.kind != LUBY_TOK_SHL && p->current.kind != LUBY_TOK_SHR && p->current.kind != LUBY_TOK_LBRACKET) {
         luby_parser_error(p, "expected method name or receiver");
         return NULL;
     }
     luby_token first = p->current;
-    luby_parser_advance(p);
+    // For [] operator method: consume both [ and ]
+    if (first.kind == LUBY_TOK_LBRACKET) {
+        luby_parser_advance(p);
+        if (p->current.kind == LUBY_TOK_RBRACKET) {
+            luby_parser_advance(p);
+            // Check for []= 
+            if (p->current.kind == LUBY_TOK_EQ) {
+                static const char s_bse[] = "[]=";
+                first.lexeme.data = s_bse; first.lexeme.length = 3;
+                luby_parser_advance(p);
+            } else {
+                static const char s_bs[] = "[]";
+                first.lexeme.data = s_bs; first.lexeme.length = 2;
+            }
+        }
+    } else {
+        luby_parser_advance(p);
+    }
     
     luby_ast_node *receiver = NULL;
     luby_token name;
@@ -3651,7 +3644,7 @@ static luby_ast_node *luby_parse_def(luby_state *L, luby_parser *p) {
         // first token was the receiver
         receiver = luby_new_node(L, LUBY_AST_IDENT, first.line, first.column);
         if (receiver) receiver->as.literal = first.lexeme;
-        if (!luby_token_is_name(p->current.kind)) {
+        if (!luby_token_is_name(p->current.kind) && p->current.kind != LUBY_TOK_SPACESHIP && p->current.kind != LUBY_TOK_EQEQ && p->current.kind != LUBY_TOK_LT && p->current.kind != LUBY_TOK_GT && p->current.kind != LUBY_TOK_LTE && p->current.kind != LUBY_TOK_GTE) {
             luby_parser_error(p, "expected method name after '.'");
             return NULL;
         }
@@ -3660,6 +3653,15 @@ static luby_ast_node *luby_parse_def(luby_state *L, luby_parser *p) {
     } else {
         // Regular method
         name = first;
+    }
+    
+    // Support setter method names: def name=(...)
+    // If next token is '=' (but not '==') followed by '(', this is a setter method
+    if (p->current.kind == LUBY_TOK_EQ && luby_token_is_name(name.kind)) {
+        // Extend the method name lexeme to include the '='
+        // In source "x=(v)", x and = are adjacent, so extending length works
+        name.lexeme.length += 1;
+        luby_parser_advance(p); // consume '='
     }
     
     luby_ast_node *node = luby_new_node(L, LUBY_AST_DEF, def_tok.line, def_tok.column);
@@ -4428,6 +4430,23 @@ static luby_ast_node *luby_parse_assignment_from(luby_state *L, luby_parser *p, 
         luby_free_node(L, lhs);
         return node;
     }
+    // obj.method = value  →  obj.method=(value)  (setter method call)
+    if (lhs->kind == LUBY_AST_CALL && lhs->as.call.recv && lhs->as.call.argc == 0) {
+        // Create setter method name: "method="
+        size_t mlen = lhs->as.call.method.length;
+        char *setter_name = (char *)luby_alloc_raw(L, NULL, mlen + 2);
+        if (setter_name) {
+            memcpy(setter_name, lhs->as.call.method.data, mlen);
+            setter_name[mlen] = '=';
+            setter_name[mlen + 1] = '\0';
+            lhs->as.call.method.data = setter_name;
+            lhs->as.call.method.length = mlen + 1;
+        }
+        lhs->as.call.args = (luby_ast_node **)luby_alloc_raw(L, NULL, sizeof(luby_ast_node *));
+        lhs->as.call.args[0] = rhs;
+        lhs->as.call.argc = 1;
+        return lhs;
+    }
     luby_parser_error(p, "invalid assignment target");
     return lhs;
 }
@@ -4987,6 +5006,7 @@ static int luby_vm_run(luby_state *L, luby_vm *vm, luby_value *out) {
                     vm->sp++;
                     break;
                 case LUBY_OP_SET_BLOCK:
+                    L->saved_block_for_call = L->current_block;
                     L->current_block = chunk->consts[inst.c];
                     break;
                 case LUBY_OP_GET_CLASS:
@@ -5036,7 +5056,15 @@ static int luby_vm_run(luby_state *L, luby_vm *vm, luby_value *out) {
                 case LUBY_OP_MAKE_MODULE: {
                     luby_value namev = chunk->consts[inst.c];
                     const char *name = namev.as.ptr ? (const char *)namev.as.ptr : "<module>";
-                    luby_class_obj *mod = luby_class_new(L, name, NULL);
+                    /* Re-open existing module if one already exists with this name */
+                    luby_string_view mod_name = { name, strlen(name) };
+                    luby_value existing = luby_get_global(L, mod_name);
+                    luby_class_obj *mod = NULL;
+                    if (existing.type == LUBY_T_MODULE && existing.as.ptr) {
+                        mod = (luby_class_obj *)existing.as.ptr;
+                    } else {
+                        mod = luby_class_new(L, name, NULL);
+                    }
                     if (!mod) { luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
                     luby_value v; v.type = LUBY_T_MODULE; v.as.ptr = mod;
                     if (!luby_vm_ensure_stack(L, vm, 1)) { luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
@@ -5102,7 +5130,6 @@ static int luby_vm_run(luby_state *L, luby_vm *vm, luby_value *out) {
                             if (method_val.type == LUBY_T_PROC) {
                                 luby_proc *m = (luby_proc *)method_val.as.ptr;
                                 luby_value block = L->current_block;
-                                L->current_block = luby_nil();
                                 f->ip++;
                                 if (!luby_vm_push_frame(L, vm, m, &m->chunk, "<method>", L->current_self, cls, name.data, 0, NULL, block, 1)) {
                                     luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0);
@@ -5113,7 +5140,6 @@ static int luby_vm_run(luby_state *L, luby_vm *vm, luby_value *out) {
                                 luby_cmethod *cm = (luby_cmethod *)method_val.as.ptr;
                                 luby_value self_args[1] = { L->current_self };
                                 luby_value r = luby_nil();
-                                L->current_block = luby_nil();
                                 if (cm->fn(L, 1, self_args, &r) != 0) {
                                     if (L->last_error.code == LUBY_E_OK) {
                                         luby_set_error(L, LUBY_E_RUNTIME, "native method failed", f->filename, line, 0);
@@ -5241,6 +5267,15 @@ static int luby_vm_run(luby_state *L, luby_vm *vm, luby_value *out) {
                                 if (rng->exclusive) e--;
                                 res = (a.as.i >= s && a.as.i <= e);
                             }
+                        } else if (luby_has_class_dispatch(a)) {
+                            /* Object ==: try == method, fallback to identity */
+                            luby_value eq_result = luby_nil();
+                            if (luby_invoke_method(L, a, "==", 1, &b, &eq_result) == 0) {
+                                res = luby_is_truthy(eq_result);
+                            } else {
+                                luby_clear_error(L);
+                                res = luby_value_eq(a, b);
+                            }
                         } else {
                             res = luby_value_eq(a, b);
                         }
@@ -5257,6 +5292,16 @@ static int luby_vm_run(luby_state *L, luby_vm *vm, luby_value *out) {
                         else if (inst.op == LUBY_OP_LTE) res = (cmp <= 0);
                         else if (inst.op == LUBY_OP_GT) res = (cmp > 0);
                         else res = (cmp >= 0);
+                    } else if (luby_has_class_dispatch(a)) {
+                        /* Object comparison: try <=> method */
+                        luby_value cmp_result = luby_nil();
+                        if (luby_invoke_method(L, a, "<=>", 1, &b, &cmp_result) == 0 && cmp_result.type == LUBY_T_INT) {
+                            int64_t cmp = cmp_result.as.i;
+                            if (inst.op == LUBY_OP_LT) res = (cmp < 0);
+                            else if (inst.op == LUBY_OP_LTE) res = (cmp <= 0);
+                            else if (inst.op == LUBY_OP_GT) res = (cmp > 0);
+                            else res = (cmp >= 0);
+                        }
                     } else {
                         double af = (a.type == LUBY_T_FLOAT) ? a.as.f : (double)a.as.i;
                         double bf = (b.type == LUBY_T_FLOAT) ? b.as.f : (double)b.as.i;
@@ -5368,6 +5413,14 @@ static int luby_vm_run(luby_state *L, luby_vm *vm, luby_value *out) {
                         for (size_t i = 0; i < h->count; i++) {
                             if (luby_value_eq(h->entries[i].key, index)) { r = h->entries[i].value; break; }
                         }
+                    } else if (luby_has_class_dispatch(target)) {
+                        /* Object with [] method */
+                        luby_value bracket_args[2] = { target, index };
+                        if (luby_invoke_method(L, target, "[]", 1, &index, &r) != 0) {
+                            luby_clear_error(L);
+                            (void)bracket_args;
+                            r = luby_nil();
+                        }
                     }
                     vm->stack[vm->sp++] = r;
                     break;
@@ -5414,6 +5467,13 @@ static int luby_vm_run(luby_state *L, luby_vm *vm, luby_value *out) {
                         h->entries[h->count].key = index;
                         h->entries[h->count].value = value;
                         h->count++;
+                    } else if (luby_has_class_dispatch(target)) {
+                        /* Object with []= method */
+                        luby_value bset_args[2] = { index, value };
+                        luby_value bset_result;
+                        if (luby_invoke_method(L, target, "[]=", 2, bset_args, &bset_result) != 0) {
+                            luby_clear_error(L);
+                        }
                     }
                     vm->stack[vm->sp++] = value;
 set_index_done:
@@ -5438,7 +5498,7 @@ set_index_done:
 
                     if (inst.op == LUBY_OP_SAFE_CALL) {
                         if (use > 0 && args[0].type == LUBY_T_NIL) {
-                            L->current_block = luby_nil();
+                            L->current_block = L->saved_block_for_call;
                             vm->stack[vm->sp++] = luby_nil();
                             break;
                         }
@@ -5453,7 +5513,7 @@ set_index_done:
                             goto vm_error;
                         }
                         luby_value block = L->current_block;
-                        L->current_block = luby_nil();
+                        L->current_block = L->saved_block_for_call;
                         f->ip++;
                         if (!luby_vm_push_frame(L, vm, sm, &sm->chunk, "<super>", L->current_self, L->current_method_class->super, mname, use, args, block, 1)) {
                             luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0);
@@ -5470,7 +5530,7 @@ set_index_done:
                             luby_proc *proc = (luby_proc *)recv.as.ptr;
                             if (!proc) { luby_set_error(L, LUBY_E_TYPE, "nil proc", f->filename, line, 0); goto vm_error; }
                             luby_value block = L->current_block;
-                            L->current_block = luby_nil();
+                            L->current_block = L->saved_block_for_call;
                             f->ip++;
                             if (!luby_vm_push_frame(L, vm, proc, &proc->chunk, "<proc>", luby_nil(), NULL, NULL, use - 1, args + 1, block, 0)) {
                                 luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0);
@@ -5482,6 +5542,30 @@ set_index_done:
                             luby_class_obj *cls = luby_get_receiver_class(recv);
 
                             if (cls && strcmp(fname, "new") == 0 && recv.type == LUBY_T_CLASS) {
+                                /* Check for singleton or cmethod override of 'new' (e.g., Struct.new) */
+                                luby_proc *new_sp = luby_class_get_singleton_method(L, cls, "new");
+                                if (new_sp) {
+                                    luby_value block = L->current_block;
+                                    L->current_block = L->saved_block_for_call;
+                                    f->ip++;
+                                    if (!luby_vm_push_frame(L, vm, new_sp, &new_sp->chunk, "<new>", recv, cls, "new", use - 1, args + 1, block, 1)) {
+                                        luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0);
+                                        goto vm_error;
+                                    }
+                                    goto vm_next_frame;
+                                }
+                                luby_value new_cm = luby_class_lookup_method(L, cls, "new");
+                                if (new_cm.type == LUBY_T_CMETHOD) {
+                                    luby_cmethod *cm = (luby_cmethod *)new_cm.as.ptr;
+                                    if (cm->fn(L, use, args, &r) != 0) {
+                                        if (L->last_error.code == LUBY_E_OK)
+                                            luby_set_error(L, LUBY_E_RUNTIME, "native method failed", f->filename, line, 0);
+                                        goto vm_error;
+                                    }
+                                    L->current_block = L->saved_block_for_call;
+                                    vm->stack[vm->sp++] = r;
+                                    break;
+                                }
                                 luby_object *obj = luby_object_new(L, cls);
                                 if (!obj) { luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
                                 r.type = LUBY_T_OBJECT; r.as.ptr = obj;
@@ -5489,7 +5573,7 @@ set_index_done:
                                 luby_proc *init = luby_class_get_method(L, cls, "initialize");
                                 if (init) {
                                     luby_value block = L->current_block;
-                                    L->current_block = luby_nil();
+                                    L->current_block = L->saved_block_for_call;
                                     f->ip++;
                                     // Push the new object as return value first - it will be replaced by frame pop
                                     // Actually: we need to return obj, not the result of initialize
@@ -5507,7 +5591,7 @@ set_index_done:
                                     vm->frames[vm->frame_count - 1].has_return_override = 1;
                                     goto vm_next_frame;
                                 }
-                                L->current_block = luby_nil();
+                                L->current_block = L->saved_block_for_call;
                                 vm->stack[vm->sp++] = r;
                                 break;
                             } else if (cls) {
@@ -5523,7 +5607,7 @@ set_index_done:
                                 if (method_val.type == LUBY_T_PROC) {
                                     luby_proc *m = (luby_proc *)method_val.as.ptr;
                                     luby_value block = L->current_block;
-                                    L->current_block = luby_nil();
+                                    L->current_block = L->saved_block_for_call;
                                     f->ip++;
                                     if (!luby_vm_push_frame(L, vm, m, &m->chunk, "<method>", recv, cls, fname, use - 1, args + 1, block, 1)) {
                                         luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0);
@@ -5532,13 +5616,14 @@ set_index_done:
                                     goto vm_next_frame;
                                 } else if (method_val.type == LUBY_T_CMETHOD) {
                                     luby_cmethod *cm = (luby_cmethod *)method_val.as.ptr;
-                                    L->current_block = luby_nil();
                                     if (cm->fn(L, use, args, &r) != 0) {
+                                        L->current_block = L->saved_block_for_call;
                                         if (L->last_error.code == LUBY_E_OK) {
                                             luby_set_error(L, LUBY_E_RUNTIME, "native method failed", f->filename, line, 0);
                                         }
                                         goto vm_error;
                                     }
+                                    L->current_block = L->saved_block_for_call;
                                     if (vm->native_yield) {
                                         vm->native_yield = 0;
                                         f->ip++;
@@ -5554,7 +5639,7 @@ set_index_done:
                                     luby_proc *sm = luby_class_get_method_from(L, start, mname);
                                     if (sm) {
                                         luby_value block = L->current_block;
-                                        L->current_block = luby_nil();
+                                        L->current_block = L->saved_block_for_call;
                                         f->ip++;
                                         if (!luby_vm_push_frame(L, vm, sm, &sm->chunk, "<super>", L->current_self, start, mname, use, args, block, 1)) {
                                             luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0);
@@ -5577,7 +5662,7 @@ set_index_done:
                                         if (mcount > 1) mm_args[1] = namev;
                                         for (int i = 2; i < mcount; i++) mm_args[i] = args[i - 1];
                                         luby_value block = L->current_block;
-                                        L->current_block = luby_nil();
+                                        L->current_block = L->saved_block_for_call;
                                         f->ip++;
                                         if (!luby_vm_push_frame(L, vm, mm, &mm->chunk, "<method_missing>", recv, cls, "method_missing", mcount - 1, mm_args + 1, block, 1)) {
                                             luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0);
@@ -5598,7 +5683,7 @@ set_index_done:
                                             L->current_vm = saved_vm;
                                             return (int)LUBY_E_OK;
                                         }
-                                        L->current_block = luby_nil();
+                                        L->current_block = L->saved_block_for_call;
                                         vm->stack[vm->sp++] = r;
                                         break;
                                     } else {
@@ -5607,7 +5692,7 @@ set_index_done:
                                     }
                                 }
                             }
-                            L->current_block = luby_nil();
+                            L->current_block = L->saved_block_for_call;
                             vm->stack[vm->sp++] = r;
                             break;
                         }
@@ -5620,7 +5705,7 @@ set_index_done:
                         if (gv.type == LUBY_T_PROC && gv.as.ptr) {
                             luby_proc *gp = (luby_proc *)gv.as.ptr;
                             luby_value block = L->current_block;
-                            L->current_block = luby_nil();
+                            L->current_block = L->saved_block_for_call;
                             f->ip++;
                             if (!luby_vm_push_frame(L, vm, gp, &gp->chunk, "<proc>", luby_nil(), NULL, NULL, use, args, block, 0)) {
                                 luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0);
@@ -5630,6 +5715,33 @@ set_index_done:
                         }
                     }
                     
+                    /* Built-in <=> for primitive types (int, float, string) */
+                    /* Must come before implicit self dispatch to prevent infinite
+                       recursion when <=> is called on primitives inside a class
+                       that defines <=> (e.g., @deg <=> other.deg in Comparable). */
+                    if (fname && strcmp(fname, "<=>") == 0 && use >= 2) {
+                        luby_value pa = args[0], pb = args[1];
+                        int handled = 1;
+                        if (pa.type == LUBY_T_INT && pb.type == LUBY_T_INT) {
+                            r = luby_int(pa.as.i < pb.as.i ? -1 : (pa.as.i > pb.as.i ? 1 : 0));
+                        } else if ((pa.type == LUBY_T_INT || pa.type == LUBY_T_FLOAT) &&
+                                   (pb.type == LUBY_T_INT || pb.type == LUBY_T_FLOAT)) {
+                            double da = (pa.type == LUBY_T_FLOAT) ? pa.as.f : (double)pa.as.i;
+                            double db = (pb.type == LUBY_T_FLOAT) ? pb.as.f : (double)pb.as.i;
+                            r = luby_int(da < db ? -1 : (da > db ? 1 : 0));
+                        } else if ((pa.type == LUBY_T_STRING || pa.type == LUBY_T_SYMBOL) && pa.type == pb.type && pa.as.ptr && pb.as.ptr) {
+                            int cmp = strcmp((const char *)pa.as.ptr, (const char *)pb.as.ptr);
+                            r = luby_int(cmp < 0 ? -1 : (cmp > 0 ? 1 : 0));
+                        } else {
+                            handled = 0;
+                        }
+                        if (handled) {
+                            L->current_block = L->saved_block_for_call;
+                            vm->stack[vm->sp++] = r;
+                            break;
+                        }
+                    }
+
                     /* Implicit self: if we're inside a method and have no receiver,
                        try to call the method on self */
                     if (fname && luby_has_class_dispatch(L->current_self)) {
@@ -5639,7 +5751,7 @@ set_index_done:
                             if (method_val.type == LUBY_T_PROC) {
                                 luby_proc *m = (luby_proc *)method_val.as.ptr;
                                 luby_value block = L->current_block;
-                                L->current_block = luby_nil();
+                                L->current_block = L->saved_block_for_call;
                                 f->ip++;
                                 if (!luby_vm_push_frame(L, vm, m, &m->chunk, "<method>", L->current_self, cls, fname, use, args, block, 1)) {
                                     luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0);
@@ -5656,13 +5768,14 @@ set_index_done:
                                 for (int i = 0; i < use && i < 15; i++) {
                                     self_args[i + 1] = args[i];
                                 }
-                                L->current_block = luby_nil();
                                 if (cm->fn(L, self_argc, self_args, &r) != 0) {
+                                    L->current_block = L->saved_block_for_call;
                                     if (L->last_error.code == LUBY_E_OK) {
                                         luby_set_error(L, LUBY_E_RUNTIME, "native method failed", f->filename, line, 0);
                                     }
                                     goto vm_error;
                                 }
+                                L->current_block = L->saved_block_for_call;
                                 if (vm->native_yield) {
                                     vm->native_yield = 0;
                                     f->ip++;
@@ -5694,7 +5807,7 @@ set_index_done:
                             return (int)LUBY_E_OK;
                         }
                     }
-                    L->current_block = luby_nil();
+                    L->current_block = L->saved_block_for_call;
                     vm->stack[vm->sp++] = r;
                     break;
                 }
@@ -5735,7 +5848,6 @@ set_index_done:
                     }
                     luby_proc *bp = (luby_proc *)L->current_block.as.ptr;
                     luby_value block = luby_nil();
-                    L->current_block = luby_nil();
                     f->ip++;
                     if (!luby_vm_push_frame(L, vm, bp, &bp->chunk, "<block>", luby_nil(), NULL, NULL, use, yargs, block, 0)) {
                         luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0);
@@ -6543,18 +6655,23 @@ static int luby_compile_call(luby_compiler *C, luby_ast_node *node) {
         return 1;
     }
     int argc = 0;
+    /* Compile block proc first (if any) but defer SET_BLOCK until just
+       before the CALL so that compiling the receiver/args (which may
+       contain inner calls with their own SET_BLOCK) doesn't clobber it. */
+    uint32_t block_pidx = 0;
+    int has_block_const = 0;
     if (node->as.call.block) {
         luby_proc *proc = luby_compile_block_proc(C, node->as.call.block);
         if (!proc) return 0;
         luby_value pv = luby_nil();
         pv.type = LUBY_T_PROC;
         pv.as.ptr = proc;
-        uint32_t pidx = luby_chunk_add_const(C->L, C->chunk, pv);
-        luby_chunk_emit(C->L, C->chunk, LUBY_OP_SET_BLOCK, 0, 0, pidx, node->line);
+        block_pidx = luby_chunk_add_const(C->L, C->chunk, pv);
+        has_block_const = 1;
     } else {
         luby_value pv = luby_nil();
-        uint32_t pidx = luby_chunk_add_const(C->L, C->chunk, pv);
-        luby_chunk_emit(C->L, C->chunk, LUBY_OP_SET_BLOCK, 0, 0, pidx, node->line);
+        block_pidx = luby_chunk_add_const(C->L, C->chunk, pv);
+        has_block_const = 1;
     }
     if (node->as.call.recv) {
         if (!luby_compile_node(C, node->as.call.recv)) return 0;
@@ -6563,6 +6680,10 @@ static int luby_compile_call(luby_compiler *C, luby_ast_node *node) {
     for (size_t i = 0; i < node->as.call.argc; i++) {
         if (!luby_compile_node(C, node->as.call.args[i])) return 0;
         argc++;
+    }
+    /* Emit SET_BLOCK right before CALL so it isn't overwritten by inner calls */
+    if (has_block_const) {
+        luby_chunk_emit(C->L, C->chunk, LUBY_OP_SET_BLOCK, 0, 0, block_pidx, node->line);
     }
     luby_value sym = luby_symbol(C->L, node->as.call.method.data, node->as.call.method.length);
     uint32_t midx = luby_chunk_add_const(C->L, C->chunk, sym);
@@ -6632,13 +6753,20 @@ static int luby_compile_node(luby_compiler *C, luby_ast_node *node) {
                 luby_chunk_patch_jump(C->chunk, jmp_end, C->chunk->count);
                 return 1;
             }
-            if (!luby_compile_node(C, node->as.binary.left)) return 0;
-            if (!luby_compile_node(C, node->as.binary.right)) return 0;
-            luby_op op = luby_binary_op_from_token(node->as.binary.op);
-            if (node->as.binary.op == LUBY_TOK_NEQ) {
+            if (node->as.binary.op == LUBY_TOK_SPACESHIP) {
+                // <=> compiles to a method call: push left (receiver), push right (arg), CALL "<=>" argc=2
+                if (!luby_compile_node(C, node->as.binary.left)) return 0;
+                if (!luby_compile_node(C, node->as.binary.right)) return 0;
+                uint8_t ci = luby_chunk_add_const(C->L, C->chunk, luby_symbol(C->L, "<=>", 0));
+                { luby_value pv = luby_nil(); uint32_t bpi = luby_chunk_add_const(C->L, C->chunk, pv); luby_chunk_emit(C->L, C->chunk, LUBY_OP_SET_BLOCK, 0, 0, bpi, node->line); }
+                luby_chunk_emit(C->L, C->chunk, LUBY_OP_CALL, 2, 0, ci, node->line);
+            } else if (!luby_compile_node(C, node->as.binary.left) || !luby_compile_node(C, node->as.binary.right)) {
+                return 0;
+            } else if (node->as.binary.op == LUBY_TOK_NEQ) {
                 luby_chunk_emit(C->L, C->chunk, LUBY_OP_EQ, 0, 0, 0, node->line);
                 luby_chunk_emit(C->L, C->chunk, LUBY_OP_NOT, 0, 0, 0, node->line);
             } else {
+                luby_op op = luby_binary_op_from_token(node->as.binary.op);
                 luby_chunk_emit(C->L, C->chunk, op, 0, 0, 0, node->line);
             }
             return 1;
@@ -7039,6 +7167,7 @@ LUBY_API luby_state *luby_new(const luby_config *cfg) {
     if (cfg) L->cfg = *cfg;
     L->last_error.code = LUBY_E_OK;
     L->current_block = luby_nil();
+    L->saved_block_for_call = luby_nil();
     L->current_class = luby_nil();
     L->current_self = luby_nil();
     L->current_method_class = NULL;
@@ -7092,15 +7221,18 @@ LUBY_API void luby_free(luby_state *L) {
 }
 
 static int luby_execute_chunk(luby_state *L, luby_chunk *chunk, luby_value *out, const char *filename) {
+    luby_value saved_sbfc = L->saved_block_for_call;
     luby_vm vm;
     luby_vm_init(&vm);
-    if (!luby_vm_ensure_stack(L, &vm, 1)) return (int)LUBY_E_OOM;
+    if (!luby_vm_ensure_stack(L, &vm, 1)) { L->saved_block_for_call = saved_sbfc; return (int)LUBY_E_OOM; }
     if (!luby_vm_push_frame(L, &vm, NULL, chunk, filename, luby_nil(), NULL, NULL, 0, NULL, luby_nil(), 0)) {
         luby_vm_free(L, &vm);
+        L->saved_block_for_call = saved_sbfc;
         return (int)LUBY_E_OOM;
     }
     int rc = luby_vm_run(L, &vm, out);
     luby_vm_free(L, &vm);
+    L->saved_block_for_call = saved_sbfc;
     return rc;
 }
 
@@ -7122,44 +7254,52 @@ static int luby_execute_chunk(luby_state *L, luby_chunk *chunk, luby_value *out,
 static int luby_call_block(luby_state *L, luby_proc *proc, int argc, const luby_value *argv, luby_value *out) {
     if (!proc) return (int)LUBY_E_TYPE;
     luby_value saved_block = L->current_block;
+    luby_value saved_sbfc = L->saved_block_for_call;
     L->current_block = luby_nil();
 
     luby_vm vm;
     luby_vm_init(&vm);
     if (!luby_vm_ensure_stack(L, &vm, 1)) {
         L->current_block = saved_block;
+        L->saved_block_for_call = saved_sbfc;
         return (int)LUBY_E_OOM;
     }
     if (!luby_vm_push_frame(L, &vm, proc, &proc->chunk, "<block>", luby_nil(), NULL, NULL, argc, argv, luby_nil(), 0)) {
         luby_vm_free(L, &vm);
         L->current_block = saved_block;
+        L->saved_block_for_call = saved_sbfc;
         return (int)LUBY_E_OOM;
     }
     int rc = luby_vm_run(L, &vm, out);
     luby_vm_free(L, &vm);
     L->current_block = saved_block;
+    L->saved_block_for_call = saved_sbfc;
     return rc;
 }
 
 static int luby_call_proc_with_self(luby_state *L, luby_proc *proc, luby_value recv, int argc, const luby_value *argv, luby_value *out) {
     if (!proc) return (int)LUBY_E_TYPE;
     luby_value saved_block = L->current_block;
+    luby_value saved_sbfc = L->saved_block_for_call;
     L->current_block = luby_nil();
 
     luby_vm vm;
     luby_vm_init(&vm);
     if (!luby_vm_ensure_stack(L, &vm, 1)) {
         L->current_block = saved_block;
+        L->saved_block_for_call = saved_sbfc;
         return (int)LUBY_E_OOM;
     }
     if (!luby_vm_push_frame(L, &vm, proc, &proc->chunk, "<method>", recv, L->current_method_class, L->current_method_name, argc, argv, luby_nil(), 1)) {
         luby_vm_free(L, &vm);
         L->current_block = saved_block;
+        L->saved_block_for_call = saved_sbfc;
         return (int)LUBY_E_OOM;
     }
     int rc = luby_vm_run(L, &vm, out);
     luby_vm_free(L, &vm);
     L->current_block = saved_block;
+    L->saved_block_for_call = saved_sbfc;
     return rc;
 }
 
@@ -7211,7 +7351,13 @@ LUBY_API int luby_eval(luby_state *L, const char *code, size_t len, const char *
     C.loop_depth = 0;
     C.in_block = 0;
     C.begin_depth = 0;
+    // Pause GC during compilation: compiled procs are stored as constants
+    // in local chunks which are not GC roots yet. GC during compilation
+    // would collect those procs, leaving dangling pointers.
+    int was_paused = L->gc_paused;
+    L->gc_paused = 1;
     if (!luby_compile_node(&C, ast)) {
+        L->gc_paused = was_paused;
         luby_free_ast(L, ast);  // frees arrays, arena frees nodes
         luby_arena_free(L, &arena);
         L->parse_arena = NULL;
@@ -7219,6 +7365,7 @@ LUBY_API int luby_eval(luby_state *L, const char *code, size_t len, const char *
         luby_set_error(L, LUBY_E_PARSE, "compile error", filename, 0, 0);
         return (int)LUBY_E_PARSE;
     }
+    L->gc_paused = was_paused;
     
     // AST is no longer needed after compilation - free arena and arrays
     luby_free_ast(L, ast);  // frees arrays only (arena handles nodes)
@@ -7553,6 +7700,7 @@ LUBY_API int luby_hash_set_value(luby_state *L, luby_value h, luby_value key, lu
 
 LUBY_API int luby_invoke_global(luby_state *L, const char *name, int argc, const luby_value *argv, luby_value *out) {
     if (!L || !name) return (int)LUBY_E_RUNTIME;
+    luby_value saved_sbfc = L->saved_block_for_call;
     
     // First check for a Luby-defined proc in globals
     luby_string_view sv = { name, strlen(name) };
@@ -7567,12 +7715,14 @@ LUBY_API int luby_invoke_global(luby_state *L, const char *name, int argc, const
         if (!luby_vm_push_frame(L, &vm, proc, &proc->chunk, name, luby_nil(), NULL, name, argc, argv, luby_nil(), 0)) {
             L->current_vm = saved_vm;
             luby_vm_free(L, &vm);
+            L->saved_block_for_call = saved_sbfc;
             return (int)LUBY_E_OOM;
         }
         
         int rc = luby_vm_run(L, &vm, out);
         L->current_vm = saved_vm;
         luby_vm_free(L, &vm);
+        L->saved_block_for_call = saved_sbfc;
         return rc;
     }
     
@@ -7590,6 +7740,7 @@ LUBY_API int luby_invoke_global(luby_state *L, const char *name, int argc, const
 
 LUBY_API int luby_invoke_method(luby_state *L, luby_value recv, const char *method, int argc, const luby_value *argv, luby_value *out) {
     if (!L || !method) return (int)LUBY_E_RUNTIME;
+    luby_value saved_sbfc = L->saved_block_for_call;
     
     luby_class_obj *cls = luby_get_receiver_class(recv);
     
@@ -7612,12 +7763,14 @@ LUBY_API int luby_invoke_method(luby_state *L, luby_value recv, const char *meth
             if (!luby_vm_push_frame(L, &vm, m, &m->chunk, method, recv, cls, method, argc, argv, luby_nil(), 1)) {
                 L->current_vm = saved_vm;
                 luby_vm_free(L, &vm);
+                L->saved_block_for_call = saved_sbfc;
                 return (int)LUBY_E_OOM;
             }
             
             int rc = luby_vm_run(L, &vm, out);
             L->current_vm = saved_vm;
             luby_vm_free(L, &vm);
+            L->saved_block_for_call = saved_sbfc;
             return rc;
         }
         
@@ -11705,6 +11858,131 @@ static int luby_str_strip(luby_state *L, int argc, const luby_value *argv, luby_
     return (int)LUBY_E_OK;
 }
 
+/* ------------------------------------------------------------------ */
+/*  Struct.new(:field1, :field2, ...) → creates a new struct class     */
+/* ------------------------------------------------------------------ */
+static int luby_struct_create_class(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    /* argv[0] = Struct class (receiver), argv[1..] = symbol names */
+    int field_count = argc - 1;
+    if (field_count < 1 || field_count > 32) {
+        luby_set_error(L, LUBY_E_TYPE, "wrong number of arguments for Struct.new", NULL, 0, 0);
+        return (int)LUBY_E_TYPE;
+    }
+    const char *fields[32];
+    for (int i = 0; i < field_count; i++) {
+        if (argv[i + 1].type != LUBY_T_SYMBOL || !argv[i + 1].as.ptr) {
+            luby_set_error(L, LUBY_E_TYPE, "expected symbol for Struct field", NULL, 0, 0);
+            return (int)LUBY_E_TYPE;
+        }
+        fields[i] = (const char *)argv[i + 1].as.ptr;
+    }
+    /* Generate unique class name */
+    static int struct_counter = 0;
+    char class_name[64];
+    snprintf(class_name, sizeof(class_name), "Struct__%d", struct_counter++);
+
+    /* Build Ruby code for the class */
+    char buf[8192];
+    int pos = 0;
+    pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), "class %s\n", class_name);
+
+    /* initialize(field1, field2, ...) */
+    pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), "  def initialize(");
+    for (int i = 0; i < field_count; i++) {
+        if (i > 0) pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), ", ");
+        pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), "%s", fields[i]);
+    }
+    pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), ")\n");
+    for (int i = 0; i < field_count; i++) {
+        pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), "    @%s = %s\n", fields[i], fields[i]);
+    }
+    pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), "  end\n");
+
+    /* attr readers and writers */
+    for (int i = 0; i < field_count; i++) {
+        pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos),
+            "  def %s\n    @%s\n  end\n", fields[i], fields[i]);
+        pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos),
+            "  def %s=(v)\n    @%s = v\n  end\n", fields[i], fields[i]);
+    }
+
+    /* to_s */
+    pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), "  def to_s\n    \"#<struct ");
+    for (int i = 0; i < field_count; i++) {
+        if (i > 0) pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), ", ");
+        pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), "%s=#{@%s}", fields[i], fields[i]);
+    }
+    pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), ">\"\n  end\n");
+
+    /* to_a */
+    pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), "  def to_a\n    [");
+    for (int i = 0; i < field_count; i++) {
+        if (i > 0) pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), ", ");
+        pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), "@%s", fields[i]);
+    }
+    pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), "]\n  end\n");
+
+    /* to_h */
+    pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), "  def to_h\n    {");
+    for (int i = 0; i < field_count; i++) {
+        if (i > 0) pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), ", ");
+        pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), "%s: @%s", fields[i], fields[i]);
+    }
+    pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), "}\n  end\n");
+
+    /* members */
+    pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), "  def members\n    [");
+    for (int i = 0; i < field_count; i++) {
+        if (i > 0) pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), ", ");
+        pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), ":%s", fields[i]);
+    }
+    pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), "]\n  end\n");
+
+    /* == */
+    pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), "  def ==(other)\n    ");
+    for (int i = 0; i < field_count; i++) {
+        if (i > 0) pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), " && ");
+        pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), "@%s == other.%s", fields[i], fields[i]);
+    }
+    pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), "\n  end\n");
+
+    /* [] accessor */
+    pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), "  def [](key)\n");
+    for (int i = 0; i < field_count; i++) {
+        pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos),
+            "    %s key == :%s || key == %d\n      @%s\n",
+            i == 0 ? "if" : "elsif", fields[i], i, fields[i]);
+    }
+    pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), "    else\n      nil\n    end\n  end\n");
+
+    /* []= accessor */
+    pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), "  def []=(key, val)\n");
+    for (int i = 0; i < field_count; i++) {
+        pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos),
+            "    %s key == :%s || key == %d\n      @%s = val\n",
+            i == 0 ? "if" : "elsif", fields[i], i, fields[i]);
+    }
+    pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), "    end\n  end\n");
+
+    /* each */
+    pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), "  def each(&blk)\n");
+    for (int i = 0; i < field_count; i++) {
+        pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), "    blk.call(@%s)\n", fields[i]);
+    }
+    pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), "    self\n  end\n");
+
+    pos += snprintf(buf + pos, (size_t)(sizeof(buf) - pos), "end\n");
+
+    /* Eval the class definition */
+    int eval_rc = luby_eval(L, buf, 0, "<struct>", NULL);
+    (void)eval_rc;
+    luby_clear_error(L);
+
+    /* Return the class */
+    if (out) *out = luby_get_global_value(L, class_name);
+    return (int)LUBY_E_OK;
+}
+
 LUBY_API void luby_open_base(luby_state *L) {
     if (!L) return;
     luby_register_function(L, "print", luby_base_print);
@@ -11969,6 +12247,433 @@ LUBY_API void luby_open_base(luby_state *L) {
                 "<coroutine>",
                 NULL);
             luby_clear_error(L);
+        }
+    }
+
+    /* ---- Comparable module ---- */
+    {
+        luby_class_obj *comp_mod = luby_class_new(L, "Comparable", NULL);
+        if (comp_mod) {
+            luby_value v; v.type = LUBY_T_MODULE; v.as.ptr = comp_mod;
+            luby_string_view name = { "Comparable", 10 };
+            luby_set_global(L, name, v);
+            luby_eval(L,
+                "module Comparable\n"
+                "  def <(other)\n"
+                "    (self <=> other) < 0\n"
+                "  end\n"
+                "  def <=(other)\n"
+                "    (self <=> other) <= 0\n"
+                "  end\n"
+                "  def ==(other)\n"
+                "    (self <=> other) == 0\n"
+                "  end\n"
+                "  def >(other)\n"
+                "    (self <=> other) > 0\n"
+                "  end\n"
+                "  def >=(other)\n"
+                "    (self <=> other) >= 0\n"
+                "  end\n"
+                "  def between?(mn, mx)\n"
+                "    self >= mn && self <= mx\n"
+                "  end\n"
+                "  def clamp(mn, mx)\n"
+                "    if self < mn\n"
+                "      mn\n"
+                "    elsif self > mx\n"
+                "      mx\n"
+                "    else\n"
+                "      self\n"
+                "    end\n"
+                "  end\n"
+                "end\n",
+                0, "<comparable>", NULL);
+            luby_clear_error(L);
+        }
+    }
+
+    /* ---- Enumerable module ---- */
+    {
+        luby_class_obj *enum_mod = luby_class_new(L, "Enumerable", NULL);
+        if (enum_mod) {
+            luby_value v; v.type = LUBY_T_MODULE; v.as.ptr = enum_mod;
+            luby_string_view name = { "Enumerable", 10 };
+            luby_set_global(L, name, v);
+            luby_eval(L,
+                "module Enumerable\n"
+                "  def to_a\n"
+                "    result = []\n"
+                "    each { |x| array_push(result, x) }\n"
+                "    result\n"
+                "  end\n"
+                "\n"
+                "  def entries\n"
+                "    to_a\n"
+                "  end\n"
+                "\n"
+                "  def map(&__blk)\n"
+                "    result = []\n"
+                "    each { |x| array_push(result, __blk.call(x)) }\n"
+                "    result\n"
+                "  end\n"
+                "\n"
+                "  def collect(&__blk)\n"
+                "    result = []\n"
+                "    each { |x| array_push(result, __blk.call(x)) }\n"
+                "    result\n"
+                "  end\n"
+                "\n"
+                "  def select(&__blk)\n"
+                "    result = []\n"
+                "    each { |x|\n"
+                "      if __blk.call(x)\n"
+                "        array_push(result, x)\n"
+                "      end\n"
+                "    }\n"
+                "    result\n"
+                "  end\n"
+                "\n"
+                "  def filter(&__blk)\n"
+                "    result = []\n"
+                "    each { |x|\n"
+                "      if __blk.call(x)\n"
+                "        array_push(result, x)\n"
+                "      end\n"
+                "    }\n"
+                "    result\n"
+                "  end\n"
+                "\n"
+                "  def reject(&__blk)\n"
+                "    result = []\n"
+                "    each { |x|\n"
+                "      if !__blk.call(x)\n"
+                "        array_push(result, x)\n"
+                "      end\n"
+                "    }\n"
+                "    result\n"
+                "  end\n"
+                "\n"
+                "  def find(&__blk)\n"
+                "    found = nil\n"
+                "    done = false\n"
+                "    each { |x|\n"
+                "      if !done && __blk.call(x)\n"
+                "        found = x\n"
+                "        done = true\n"
+                "      end\n"
+                "    }\n"
+                "    found\n"
+                "  end\n"
+                "\n"
+                "  def detect(&__blk)\n"
+                "    found = nil\n"
+                "    done = false\n"
+                "    each { |x|\n"
+                "      if !done && __blk.call(x)\n"
+                "        found = x\n"
+                "        done = true\n"
+                "      end\n"
+                "    }\n"
+                "    found\n"
+                "  end\n"
+                "\n"
+                "  def any?(&__blk)\n"
+                "    result = false\n"
+                "    each { |x|\n"
+                "      __v = __blk ? __blk.call(x) : x\n"
+                "      if __v\n"
+                "        result = true\n"
+                "      end\n"
+                "    }\n"
+                "    result\n"
+                "  end\n"
+                "\n"
+                "  def all?(&__blk)\n"
+                "    result = true\n"
+                "    each { |x|\n"
+                "      __v = __blk ? __blk.call(x) : x\n"
+                "      if !__v\n"
+                "        result = false\n"
+                "      end\n"
+                "    }\n"
+                "    result\n"
+                "  end\n"
+                "\n"
+                "  def none?(&__blk)\n"
+                "    result = true\n"
+                "    each { |x|\n"
+                "      __v = __blk ? __blk.call(x) : x\n"
+                "      if __v\n"
+                "        result = false\n"
+                "      end\n"
+                "    }\n"
+                "    result\n"
+                "  end\n"
+                "\n"
+                "  def reduce(init, &__blk)\n"
+                "    acc = init\n"
+                "    each { |x| acc = __blk.call(acc, x) }\n"
+                "    acc\n"
+                "  end\n"
+                "\n"
+                "  def inject(init, &__blk)\n"
+                "    acc = init\n"
+                "    each { |x| acc = __blk.call(acc, x) }\n"
+                "    acc\n"
+                "  end\n"
+                "\n"
+                "  def count(&__blk)\n"
+                "    n = 0\n"
+                "    if __blk\n"
+                "      each { |x|\n"
+                "        if __blk.call(x)\n"
+                "          n = n + 1\n"
+                "        end\n"
+                "      }\n"
+                "    else\n"
+                "      each { |x| n = n + 1 }\n"
+                "    end\n"
+                "    n\n"
+                "  end\n"
+                "\n"
+                "  def sum(init)\n"
+                "    acc = init ? init : 0\n"
+                "    each { |x| acc = acc + x }\n"
+                "    acc\n"
+                "  end\n"
+                "\n"
+                "  def min\n"
+                "    best = nil\n"
+                "    each { |x|\n"
+                "      if best == nil || x < best\n"
+                "        best = x\n"
+                "      end\n"
+                "    }\n"
+                "    best\n"
+                "  end\n"
+                "\n"
+                "  def max\n"
+                "    best = nil\n"
+                "    each { |x|\n"
+                "      if best == nil || x > best\n"
+                "        best = x\n"
+                "      end\n"
+                "    }\n"
+                "    best\n"
+                "  end\n"
+                "\n"
+                "  def min_by(&__blk)\n"
+                "    best = nil\n"
+                "    best_val = nil\n"
+                "    each { |x|\n"
+                "      __v = __blk.call(x)\n"
+                "      if best_val == nil || __v < best_val\n"
+                "        best = x\n"
+                "        best_val = __v\n"
+                "      end\n"
+                "    }\n"
+                "    best\n"
+                "  end\n"
+                "\n"
+                "  def max_by(&__blk)\n"
+                "    best = nil\n"
+                "    best_val = nil\n"
+                "    each { |x|\n"
+                "      __v = __blk.call(x)\n"
+                "      if best_val == nil || __v > best_val\n"
+                "        best = x\n"
+                "        best_val = __v\n"
+                "      end\n"
+                "    }\n"
+                "    best\n"
+                "  end\n"
+                "\n"
+                "  def sort\n"
+                "    arr = to_a\n"
+                "    __n = length(arr)\n"
+                "    __i = 0\n"
+                "    while __i < __n - 1\n"
+                "      __j = 0\n"
+                "      while __j < __n - __i - 1\n"
+                "        if arr[__j] > arr[__j + 1]\n"
+                "          __tmp = arr[__j]\n"
+                "          arr[__j] = arr[__j + 1]\n"
+                "          arr[__j + 1] = __tmp\n"
+                "        end\n"
+                "        __j = __j + 1\n"
+                "      end\n"
+                "      __i = __i + 1\n"
+                "    end\n"
+                "    arr\n"
+                "  end\n"
+                "\n"
+                "  def sort_by(&__blk)\n"
+                "    arr = to_a\n"
+                "    __n = length(arr)\n"
+                "    __keys = []\n"
+                "    each { |x| array_push(__keys, __blk.call(x)) }\n"
+                "    __i = 0\n"
+                "    while __i < __n - 1\n"
+                "      __j = 0\n"
+                "      while __j < __n - __i - 1\n"
+                "        if __keys[__j] > __keys[__j + 1]\n"
+                "          __tmp = arr[__j]\n"
+                "          arr[__j] = arr[__j + 1]\n"
+                "          arr[__j + 1] = __tmp\n"
+                "          __tmp = __keys[__j]\n"
+                "          __keys[__j] = __keys[__j + 1]\n"
+                "          __keys[__j + 1] = __tmp\n"
+                "        end\n"
+                "        __j = __j + 1\n"
+                "      end\n"
+                "      __i = __i + 1\n"
+                "    end\n"
+                "    arr\n"
+                "  end\n"
+                "\n"
+                "  def flat_map(&__blk)\n"
+                "    result = []\n"
+                "    each { |x|\n"
+                "      __v = __blk.call(x)\n"
+                "      if type(__v) == \"array\"\n"
+                "        __fi = 0\n"
+                "        while __fi < length(__v)\n"
+                "          array_push(result, __v[__fi])\n"
+                "          __fi = __fi + 1\n"
+                "        end\n"
+                "      else\n"
+                "        array_push(result, __v)\n"
+                "      end\n"
+                "    }\n"
+                "    result\n"
+                "  end\n"
+                "\n"
+                "  def each_with_index(&__blk)\n"
+                "    __ei = 0\n"
+                "    each { |x|\n"
+                "      __blk.call(x, __ei)\n"
+                "      __ei = __ei + 1\n"
+                "    }\n"
+                "    self\n"
+                "  end\n"
+                "\n"
+                "  def each_with_object(obj, &__blk)\n"
+                "    each { |x| __blk.call(x, obj) }\n"
+                "    obj\n"
+                "  end\n"
+                "\n"
+                "  def include?(val)\n"
+                "    found = false\n"
+                "    each { |x|\n"
+                "      if x == val\n"
+                "        found = true\n"
+                "      end\n"
+                "    }\n"
+                "    found\n"
+                "  end\n"
+                "\n"
+                "  def first(n)\n"
+                "    if n\n"
+                "      result = []\n"
+                "      __fsi = 0\n"
+                "      each { |x|\n"
+                "        if __fsi < n\n"
+                "          array_push(result, x)\n"
+                "          __fsi = __fsi + 1\n"
+                "        end\n"
+                "      }\n"
+                "      result\n"
+                "    else\n"
+                "      found = nil\n"
+                "      __done = false\n"
+                "      each { |x|\n"
+                "        if !__done\n"
+                "          found = x\n"
+                "          __done = true\n"
+                "        end\n"
+                "      }\n"
+                "      found\n"
+                "    end\n"
+                "  end\n"
+                "\n"
+                "  def take(n)\n"
+                "    first(n)\n"
+                "  end\n"
+                "\n"
+                "  def drop(n)\n"
+                "    result = []\n"
+                "    __di = 0\n"
+                "    each { |x|\n"
+                "      if __di >= n\n"
+                "        array_push(result, x)\n"
+                "      end\n"
+                "      __di = __di + 1\n"
+                "    }\n"
+                "    result\n"
+                "  end\n"
+                "\n"
+                "  def group_by(&__blk)\n"
+                "    result = {}\n"
+                "    each { |x|\n"
+                "      __key = __blk.call(x)\n"
+                "      if result[__key] == nil\n"
+                "        result[__key] = []\n"
+                "      end\n"
+                "      array_push(result[__key], x)\n"
+                "    }\n"
+                "    result\n"
+                "  end\n"
+                "\n"
+                "  def tally\n"
+                "    result = {}\n"
+                "    each { |x|\n"
+                "      if result[x]\n"
+                "        result[x] = result[x] + 1\n"
+                "      else\n"
+                "        result[x] = 1\n"
+                "      end\n"
+                "    }\n"
+                "    result\n"
+                "  end\n"
+                "\n"
+                "  def zip(other)\n"
+                "    arr = to_a\n"
+                "    result = []\n"
+                "    __zi = 0\n"
+                "    while __zi < length(arr)\n"
+                "      if __zi < length(other)\n"
+                "        array_push(result, [arr[__zi], other[__zi]])\n"
+                "      else\n"
+                "        array_push(result, [arr[__zi], nil])\n"
+                "      end\n"
+                "      __zi = __zi + 1\n"
+                "    end\n"
+                "    result\n"
+                "  end\n"
+                "end\n",
+                0, "<enumerable>", NULL);
+            luby_clear_error(L);
+        }
+    }
+
+    /* ---- Struct class ---- */
+    {
+        luby_class_obj *struct_cls = luby_class_new(L, "Struct", NULL);
+        if (struct_cls) {
+            luby_value v; v.type = LUBY_T_CLASS; v.as.ptr = struct_cls;
+            luby_string_view name = { "Struct", 6 };
+            luby_set_global(L, name, v);
+            /* Add cmethod 'new' which creates struct classes */
+            luby_cmethod *cm = (luby_cmethod *)luby_gc_alloc(L, sizeof(luby_cmethod), LUBY_GC_CMETHOD);
+            if (cm) {
+                cm->fn = luby_struct_create_class;
+                luby_value key = luby_symbol(L, "new", 0);
+                luby_value val; val.type = LUBY_T_CMETHOD; val.as.ptr = cm;
+                luby_hash_set_value(L,
+                    (luby_value){ .type = LUBY_T_HASH, .as.ptr = struct_cls->methods },
+                    key, val);
+                L->method_epoch++;
+            }
         }
     }
 }

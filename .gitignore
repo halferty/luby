@@ -1,20 +1,57 @@
 # Compiled binaries
+*.exe
+*.out
+*.dSYM/
+*.bak
+
+# Platform-specific executables (no extension) in tests/ and examples/
+tests/arena_bench
 tests/basic
+tests/block_break
+tests/break_value
+tests/condassign
+tests/cvar
+tests/euler
+tests/exceptions
 tests/features
 tests/file_line
+tests/for_loop
 tests/game_math
+tests/gc_debug
+tests/hash_methods
+tests/heredoc
+tests/implicit_self
+tests/kwargs
+tests/leak_test
+tests/loop
 tests/minimal_rewind
 tests/missing
+tests/module_function
 tests/more
 tests/numeric
+tests/range
 tests/reflection
+tests/rosetta
+tests/scope_shadow
+tests/stdlib
+tests/string_array
+tests/string_methods
+tests/struct_debug
+tests/struct_enum
+tests/symbol_to_proc
+tests/test_enum_full
+tests/userdata
 tests/vfs
 tests/visibility
+tests/with_index
 examples/run_file
 
 # Object files
 *.o
 *.obj
+
+# Debug/test output
+tests/*.txt
 
 # macOS
 .DS_Store
