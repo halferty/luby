@@ -3,10 +3,6 @@
 ## In Progress
 
 ## Planned
-- [ ] `Struct` class (`Struct.new(:name, :age)`)
-- [ ] `Comparable` and `Enumerable` as includable modules
-- [ ] Lazy enumerator support
-- [ ] Fiber support
 
 ## Maybe Later
 - [ ] Regex support
@@ -62,3 +58,12 @@
 - [x] `while`/`until` with optional `do` keyword (`while cond do ... end`)
 - [x] `break`/`next` inside block iterators (`each`, `map`, `select`, `times`, `reduce`, etc.)
 - [x] Lexer fix: integer literal followed by dot-method (`3.times`) no longer misparsed as float
+- [x] `Struct` class (`Struct.new(:name, :age)`) with generated `initialize`, accessors, `to_a`, `to_h`, `members`, `==`, `[]`, `[]=`, `each`, `to_s`
+- [x] `Comparable` module (`<`, `<=`, `==`, `>`, `>=`, `between?`, `clamp` via `<=>`)
+- [x] `Enumerable` module (30 methods: `to_a`, `map`, `select`, `reject`, `find`, `count`, `include?`, `min`, `max`, `sum`, `reduce`, `any?`, `all?`, `none?`, `min_by`, `max_by`, `sort`, `sort_by`, `flat_map`, `each_with_index`, `first`, `take`, `drop`, `group_by`, `tally`, `zip`, `each_with_object`, `entries`, `collect`)
+- [x] Spaceship operator (`<=>`) with built-in handling for Integer, Float, String
+- [x] Operator method definitions (`def <=>`, `def []`, `def []=`, setter methods `def name=`)
+- [x] Object comparison dispatch via `<=>` in comparison opcodes
+- [x] GC fix: pause GC during compilation (compiled procs in chunk constants are not GC roots)
+- [x] `Fiber` class (`Fiber.new { }`, `fiber.resume(val)`, `Fiber.yield(val)`, `fiber.alive?`) — cooperative concurrency with bidirectional value passing, built on existing coroutine infrastructure via `luby_native_yield`
+- [x] Lazy enumerator (`[1,2,3].lazy`, `(1..100).lazy`) — chain-based pipeline with `map`, `select`, `reject`, `take`, `drop`, `flat_map`, `first`, and all consuming methods; short-circuits for `take`/`drop`/`first`

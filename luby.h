@@ -8164,6 +8164,488 @@ static int luby_coroutine_alive_cfunc(luby_state *L, int argc, const luby_value 
     return (int)LUBY_E_OK;
 }
 
+/* ---- Fiber cfuncs ---- */
+
+static int luby_fiber_new_cfunc(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    luby_proc *proc = NULL;
+    if (argc >= 1 && argv[0].type == LUBY_T_PROC) proc = (luby_proc *)argv[0].as.ptr;
+    else if (L->current_block.type == LUBY_T_PROC) proc = (luby_proc *)L->current_block.as.ptr;
+    if (!proc) {
+        luby_set_error(L, LUBY_E_TYPE, "tried to create Fiber without a block", NULL, 0, 0);
+        return (int)LUBY_E_TYPE;
+    }
+
+    luby_coroutine *co = luby_coroutine_new(L, (luby_value){ .type = LUBY_T_PROC, .as.ptr = proc });
+    if (!co) return (int)LUBY_E_OOM;
+
+    luby_string_view name = { "Fiber", 5 };
+    luby_value cv = luby_get_global(L, name);
+    luby_class_obj *cls = NULL;
+    if (cv.type == LUBY_T_CLASS && cv.as.ptr) {
+        cls = (luby_class_obj *)cv.as.ptr;
+    } else {
+        cls = luby_class_new(L, "Fiber", NULL);
+        if (!cls) return (int)LUBY_E_OOM;
+        luby_value v; v.type = LUBY_T_CLASS; v.as.ptr = cls;
+        luby_set_global(L, name, v);
+    }
+    luby_object *obj = luby_object_new(L, cls);
+    if (!obj) return (int)LUBY_E_OOM;
+    luby_value ov; ov.type = LUBY_T_OBJECT; ov.as.ptr = obj;
+
+    luby_value key_ptr = luby_symbol(L, "_co_ptr", 0);
+    luby_hash_set_value(L, (luby_value){ .type = LUBY_T_HASH, .as.ptr = obj->ivars }, key_ptr, luby_int((int64_t)(intptr_t)co));
+    if (out) *out = ov;
+    return (int)LUBY_E_OK;
+}
+
+static int luby_fiber_resume_cfunc(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (argc < 1 || argv[0].type != LUBY_T_OBJECT || !argv[0].as.ptr) {
+        luby_set_error(L, LUBY_E_TYPE, "resume called on non-Fiber", NULL, 0, 0);
+        return (int)LUBY_E_TYPE;
+    }
+    luby_object *obj = (luby_object *)argv[0].as.ptr;
+    luby_value key_ptr = luby_symbol(L, "_co_ptr", 0);
+    luby_value pv = luby_nil();
+    luby_hash_get_value((luby_value){ .type = LUBY_T_HASH, .as.ptr = obj->ivars }, key_ptr, &pv);
+    if (pv.type != LUBY_T_INT) {
+        luby_set_error(L, LUBY_E_TYPE, "resume called on non-Fiber", NULL, 0, 0);
+        return (int)LUBY_E_TYPE;
+    }
+    luby_coroutine *co = (luby_coroutine *)(intptr_t)pv.as.i;
+    if (!co) {
+        luby_set_error(L, LUBY_E_TYPE, "resume called on non-Fiber", NULL, 0, 0);
+        return (int)LUBY_E_TYPE;
+    }
+
+    luby_value rv = luby_nil();
+    int yielded = 0;
+    int rc = luby_coroutine_resume(L, co, argc - 1, argv + 1, &rv, &yielded);
+    if (out) *out = rv;
+    return rc;
+}
+
+static int luby_fiber_yield_cfunc(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (!L->current_coroutine) {
+        luby_set_error(L, LUBY_E_RUNTIME, "Fiber.yield called outside of fiber", NULL, 0, 0);
+        return (int)LUBY_E_RUNTIME;
+    }
+    luby_value val = (argc >= 1) ? argv[0] : luby_nil();
+    return luby_native_yield(L, val);
+}
+
+static int luby_fiber_alive_cfunc(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (argc < 1 || argv[0].type != LUBY_T_OBJECT || !argv[0].as.ptr) return (int)LUBY_E_TYPE;
+    luby_object *obj = (luby_object *)argv[0].as.ptr;
+    luby_value key_ptr = luby_symbol(L, "_co_ptr", 0);
+    luby_value pv = luby_nil();
+    luby_hash_get_value((luby_value){ .type = LUBY_T_HASH, .as.ptr = obj->ivars }, key_ptr, &pv);
+    luby_coroutine *co = (pv.type == LUBY_T_INT) ? (luby_coroutine *)(intptr_t)pv.as.i : NULL;
+    int alive = (co && !co->done);
+    if (out) *out = luby_bool(alive);
+    return (int)LUBY_E_OK;
+}
+
+/* ---- Lazy Enumerator ---- */
+
+/* Step kinds: 0=identity, 1=map, 2=select, 3=reject, 4=take, 5=drop, 6=flat_map */
+#define LAZY_IDENTITY 0
+#define LAZY_MAP      1
+#define LAZY_SELECT   2
+#define LAZY_REJECT   3
+#define LAZY_TAKE     4
+#define LAZY_DROP     5
+#define LAZY_FLAT_MAP 6
+#define LAZY_MAX_STEPS 64
+
+typedef struct {
+    int kind;
+    luby_proc *block;   /* for map/select/reject/flat_map */
+    int64_t n;          /* for take/drop */
+    int64_t counter;    /* runtime counter for take/drop */
+} lazy_step;
+
+/* Helper: get Lazy class, creating if needed */
+static luby_class_obj *lazy_get_class(luby_state *L) {
+    luby_string_view name = { "Lazy", 4 };
+    luby_value cv = luby_get_global(L, name);
+    if (cv.type == LUBY_T_CLASS && cv.as.ptr) return (luby_class_obj *)cv.as.ptr;
+    luby_class_obj *cls = luby_class_new(L, "Lazy", NULL);
+    if (!cls) return NULL;
+    luby_value v; v.type = LUBY_T_CLASS; v.as.ptr = cls;
+    luby_set_global(L, name, v);
+    return cls;
+}
+
+/* Helper: create a Lazy object with ivars */
+static luby_value lazy_make_obj(luby_state *L, luby_value source, luby_value parent, int kind, luby_value arg) {
+    luby_class_obj *cls = lazy_get_class(L);
+    if (!cls) return luby_nil();
+    luby_object *obj = luby_object_new(L, cls);
+    if (!obj) return luby_nil();
+    luby_enum_set_field(L, obj, "_lz_src", source);
+    luby_enum_set_field(L, obj, "_lz_par", parent);
+    luby_enum_set_field(L, obj, "_lz_kind", luby_int(kind));
+    luby_enum_set_field(L, obj, "_lz_arg", arg);
+    luby_value ov; ov.type = LUBY_T_OBJECT; ov.as.ptr = obj;
+    return ov;
+}
+
+/* lazy_create(source) — creates root Lazy wrapping a source */
+static int luby_lazy_create(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (argc < 1) return (int)LUBY_E_TYPE;
+    luby_value ov = lazy_make_obj(L, argv[0], luby_nil(), LAZY_IDENTITY, luby_nil());
+    if (ov.type == LUBY_T_NIL) return (int)LUBY_E_OOM;
+    if (out) *out = ov;
+    return (int)LUBY_E_OK;
+}
+
+/* lazy_chain(parent_lazy, kind_int, arg) — creates child Lazy */
+static int luby_lazy_chain(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (argc < 3) return (int)LUBY_E_TYPE;
+    luby_value parent = argv[0];
+    int kind = (argv[1].type == LUBY_T_INT) ? (int)argv[1].as.i : 0;
+    luby_value arg = argv[2];
+    luby_value ov = lazy_make_obj(L, luby_nil(), parent, kind, arg);
+    if (ov.type == LUBY_T_NIL) return (int)LUBY_E_OOM;
+    if (out) *out = ov;
+    return (int)LUBY_E_OK;
+}
+
+/* Walk chain to collect steps and find root source */
+static int lazy_collect_steps(luby_state *L, luby_value lv, lazy_step *steps, int *nsteps, luby_value *source) {
+    /* Walk to root, collecting steps in reverse */
+    luby_value chain[LAZY_MAX_STEPS];
+    int depth = 0;
+    luby_value cur = lv;
+    while (cur.type == LUBY_T_OBJECT && cur.as.ptr) {
+        if (depth >= LAZY_MAX_STEPS) return 0;
+        chain[depth++] = cur;
+        luby_object *obj = (luby_object *)cur.as.ptr;
+        luby_value par = luby_nil();
+        luby_enum_get_field(L, obj, "_lz_par", &par);
+        if (par.type != LUBY_T_OBJECT) break;
+        cur = par;
+    }
+    /* cur / chain[depth-1] is the root */
+    luby_object *root = (luby_object *)chain[depth - 1].as.ptr;
+    luby_enum_get_field(L, root, "_lz_src", source);
+
+    /* Collect steps from root to leaf (reverse of chain order), skip root identity */
+    *nsteps = 0;
+    for (int i = depth - 2; i >= 0; i--) {
+        luby_object *obj = (luby_object *)chain[i].as.ptr;
+        luby_value kv = luby_nil(), av = luby_nil();
+        luby_enum_get_field(L, obj, "_lz_kind", &kv);
+        luby_enum_get_field(L, obj, "_lz_arg", &av);
+        int kind = (kv.type == LUBY_T_INT) ? (int)kv.as.i : 0;
+        if (kind == LAZY_IDENTITY) continue;
+        lazy_step *s = &steps[*nsteps];
+        s->kind = kind;
+        s->block = (av.type == LUBY_T_PROC && av.as.ptr) ? (luby_proc *)av.as.ptr : NULL;
+        s->n = (av.type == LUBY_T_INT) ? av.as.i : 0;
+        s->counter = 0;
+        (*nsteps)++;
+    }
+    return 1;
+}
+
+/* Process one element through the pipeline. Returns:
+   0 = emit this element, 1 = skip, 2 = stop iteration */
+static int lazy_process_element(luby_state *L, luby_value *elem, lazy_step *steps, int nsteps) {
+    for (int i = 0; i < nsteps; i++) {
+        lazy_step *s = &steps[i];
+        switch (s->kind) {
+            case LAZY_MAP: {
+                if (!s->block) return 1;
+                luby_value res = luby_nil();
+                if (luby_call_block(L, s->block, 1, elem, &res) != 0) return 1;
+                *elem = res;
+                break;
+            }
+            case LAZY_SELECT: {
+                if (!s->block) return 1;
+                luby_value res = luby_nil();
+                if (luby_call_block(L, s->block, 1, elem, &res) != 0) return 1;
+                if (res.type == LUBY_T_NIL || (res.type == LUBY_T_BOOL && !res.as.b) ||
+                    (res.type == LUBY_T_INT && res.as.i == 0)) return 1;
+                break;
+            }
+            case LAZY_REJECT: {
+                if (!s->block) return 1;
+                luby_value res = luby_nil();
+                if (luby_call_block(L, s->block, 1, elem, &res) != 0) return 1;
+                if (!(res.type == LUBY_T_NIL || (res.type == LUBY_T_BOOL && !res.as.b) ||
+                      (res.type == LUBY_T_INT && res.as.i == 0))) return 1;
+                break;
+            }
+            case LAZY_TAKE: {
+                if (s->counter >= s->n) return 2;
+                s->counter++;
+                break;
+            }
+            case LAZY_DROP: {
+                if (s->counter < s->n) { s->counter++; return 1; }
+                break;
+            }
+            default: break;
+        }
+    }
+    return 0;
+}
+
+/* lazy_to_a(lazy_obj) — force the pipeline, return array */
+static int luby_lazy_to_a(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (argc < 1 || argv[0].type != LUBY_T_OBJECT || !argv[0].as.ptr)
+        return (int)LUBY_E_TYPE;
+
+    lazy_step steps[LAZY_MAX_STEPS];
+    int nsteps = 0;
+    luby_value source = luby_nil();
+    if (!lazy_collect_steps(L, argv[0], steps, &nsteps, &source)) return (int)LUBY_E_RUNTIME;
+
+    int was_paused = L->gc_paused; L->gc_paused = 1;
+    luby_value result = luby_array_new(L);
+    int has_flat_map = 0;
+    for (int i = 0; i < nsteps; i++) if (steps[i].kind == LAZY_FLAT_MAP) has_flat_map = 1;
+
+    if (source.type == LUBY_T_ARRAY && source.as.ptr) {
+        luby_array *arr = (luby_array *)source.as.ptr;
+        for (size_t i = 0; i < arr->count; i++) {
+            if (has_flat_map) {
+                /* flat_map: need to expand results and process rest of pipeline for each */
+                luby_value cur = arr->items[i];
+                int stop = 0;
+                /* Process steps up to first flat_map */
+                int fm_idx = -1;
+                for (int si = 0; si < nsteps; si++) {
+                    if (steps[si].kind == LAZY_FLAT_MAP) { fm_idx = si; break; }
+                    int r = lazy_process_element(L, &cur, &steps[si], 1);
+                    if (r == 1) goto next_arr_fm;
+                    if (r == 2) { stop = 1; break; }
+                }
+                if (stop) { L->gc_paused = was_paused; goto done; }
+                if (fm_idx >= 0 && steps[fm_idx].block) {
+                    luby_value fm_res = luby_nil();
+                    luby_call_block(L, steps[fm_idx].block, 1, &cur, &fm_res);
+                    /* Iterate result of flat_map */
+                    luby_value items[256];
+                    int item_count = 0;
+                    if (fm_res.type == LUBY_T_ARRAY && fm_res.as.ptr) {
+                        luby_array *fa = (luby_array *)fm_res.as.ptr;
+                        for (size_t fi = 0; fi < fa->count && fi < 256; fi++)
+                            items[item_count++] = fa->items[fi];
+                    } else {
+                        items[item_count++] = fm_res;
+                    }
+                    /* Process remaining steps for each expanded item */
+                    for (int fi = 0; fi < item_count; fi++) {
+                        luby_value elem = items[fi];
+                        int remaining_nsteps = nsteps - fm_idx - 1;
+                        int r = 0;
+                        if (remaining_nsteps > 0)
+                            r = lazy_process_element(L, &elem, &steps[fm_idx + 1], remaining_nsteps);
+                        if (r == 0) luby_array_push_value(L, result, elem);
+                        if (r == 2) { L->gc_paused = was_paused; goto done; }
+                    }
+                }
+                next_arr_fm:;
+            } else {
+                luby_value elem = arr->items[i];
+                int r = lazy_process_element(L, &elem, steps, nsteps);
+                if (r == 0) luby_array_push_value(L, result, elem);
+                if (r == 2) break;
+            }
+        }
+    } else if (source.type == LUBY_T_RANGE && source.as.ptr) {
+        luby_range *rng = (luby_range *)source.as.ptr;
+        if (rng->start.type == LUBY_T_INT && rng->end.type == LUBY_T_INT) {
+            int64_t start = rng->start.as.i;
+            int64_t end = rng->end.as.i;
+            if (rng->exclusive) end--;
+            for (int64_t i = start; i <= end; i++) {
+                if (has_flat_map) {
+                    luby_value cur = luby_int(i);
+                    int stop = 0;
+                    int fm_idx = -1;
+                    for (int si = 0; si < nsteps; si++) {
+                        if (steps[si].kind == LAZY_FLAT_MAP) { fm_idx = si; break; }
+                        int r = lazy_process_element(L, &cur, &steps[si], 1);
+                        if (r == 1) goto next_rng_fm;
+                        if (r == 2) { stop = 1; break; }
+                    }
+                    if (stop) { L->gc_paused = was_paused; goto done; }
+                    if (fm_idx >= 0 && steps[fm_idx].block) {
+                        luby_value fm_res = luby_nil();
+                        luby_call_block(L, steps[fm_idx].block, 1, &cur, &fm_res);
+                        luby_value items[256];
+                        int item_count = 0;
+                        if (fm_res.type == LUBY_T_ARRAY && fm_res.as.ptr) {
+                            luby_array *fa = (luby_array *)fm_res.as.ptr;
+                            for (size_t fi = 0; fi < fa->count && fi < 256; fi++)
+                                items[item_count++] = fa->items[fi];
+                        } else {
+                            items[item_count++] = fm_res;
+                        }
+                        for (int fi = 0; fi < item_count; fi++) {
+                            luby_value elem = items[fi];
+                            int remaining_nsteps = nsteps - fm_idx - 1;
+                            int r = 0;
+                            if (remaining_nsteps > 0)
+                                r = lazy_process_element(L, &elem, &steps[fm_idx + 1], remaining_nsteps);
+                            if (r == 0) luby_array_push_value(L, result, elem);
+                            if (r == 2) { L->gc_paused = was_paused; goto done; }
+                        }
+                    }
+                    next_rng_fm:;
+                } else {
+                    luby_value elem = luby_int(i);
+                    int r = lazy_process_element(L, &elem, steps, nsteps);
+                    if (r == 0) luby_array_push_value(L, result, elem);
+                    if (r == 2) break;
+                }
+            }
+        }
+    } else if (source.type == LUBY_T_OBJECT || source.type == LUBY_T_HASH) {
+        /* Fallback: call to_a on source first, then process */
+        luby_value arr_val = luby_nil();
+        if (luby_invoke_method(L, source, "to_a", 0, NULL, &arr_val) == 0 &&
+            arr_val.type == LUBY_T_ARRAY && arr_val.as.ptr) {
+            luby_array *arr = (luby_array *)arr_val.as.ptr;
+            for (size_t i = 0; i < arr->count; i++) {
+                luby_value elem = arr->items[i];
+                int r = lazy_process_element(L, &elem, steps, nsteps);
+                if (r == 0) luby_array_push_value(L, result, elem);
+                if (r == 2) break;
+            }
+        }
+    }
+
+done:
+    L->gc_paused = was_paused;
+    if (out) *out = result;
+    return (int)LUBY_E_OK;
+}
+
+/* lazy_each(lazy_obj) — force pipeline, yield each to current block */
+static int luby_lazy_each(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (argc < 1 || argv[0].type != LUBY_T_OBJECT || !argv[0].as.ptr)
+        return (int)LUBY_E_TYPE;
+    luby_proc *block = (L && L->current_block.type == LUBY_T_PROC) ? (luby_proc *)L->current_block.as.ptr : NULL;
+    if (!block) {
+        /* No block — return to_a */
+        return luby_lazy_to_a(L, argc, argv, out);
+    }
+
+    lazy_step steps[LAZY_MAX_STEPS];
+    int nsteps = 0;
+    luby_value source = luby_nil();
+    if (!lazy_collect_steps(L, argv[0], steps, &nsteps, &source)) return (int)LUBY_E_RUNTIME;
+
+    /* Iterate source, process pipeline, yield to block */
+    if (source.type == LUBY_T_ARRAY && source.as.ptr) {
+        luby_array *arr = (luby_array *)source.as.ptr;
+        for (size_t i = 0; i < arr->count; i++) {
+            luby_value elem = arr->items[i];
+            int r = lazy_process_element(L, &elem, steps, nsteps);
+            if (r == 2) break;
+            if (r == 0) {
+                luby_value res = luby_nil();
+                LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &elem, &res, out, luby_nil());
+            }
+        }
+    } else if (source.type == LUBY_T_RANGE && source.as.ptr) {
+        luby_range *rng = (luby_range *)source.as.ptr;
+        if (rng->start.type == LUBY_T_INT && rng->end.type == LUBY_T_INT) {
+            int64_t start = rng->start.as.i;
+            int64_t end = rng->end.as.i;
+            if (rng->exclusive) end--;
+            for (int64_t i = start; i <= end; i++) {
+                luby_value elem = luby_int(i);
+                int r = lazy_process_element(L, &elem, steps, nsteps);
+                if (r == 2) break;
+                if (r == 0) {
+                    luby_value res = luby_nil();
+                    LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &elem, &res, out, luby_nil());
+                }
+            }
+        }
+    } else {
+        luby_value arr_val = luby_nil();
+        if (luby_invoke_method(L, source, "to_a", 0, NULL, &arr_val) == 0 &&
+            arr_val.type == LUBY_T_ARRAY && arr_val.as.ptr) {
+            luby_array *arr = (luby_array *)arr_val.as.ptr;
+            for (size_t i = 0; i < arr->count; i++) {
+                luby_value elem = arr->items[i];
+                int r = lazy_process_element(L, &elem, steps, nsteps);
+                if (r == 2) break;
+                if (r == 0) {
+                    luby_value res = luby_nil();
+                    LUBY_CALL_BLOCK_OR_BREAK(L, block, 1, &elem, &res, out, luby_nil());
+                }
+            }
+        }
+    }
+
+    if (out) *out = argv[0];
+    return (int)LUBY_E_OK;
+}
+
+/* lazy_first_n(lazy_obj, n) — force pipeline with limit */
+static int luby_lazy_first_n(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (argc < 2) return (int)LUBY_E_TYPE;
+    int64_t limit = (argv[1].type == LUBY_T_INT) ? argv[1].as.i : 1;
+    if (limit <= 0) { if (out) *out = luby_array_new(L); return (int)LUBY_E_OK; }
+
+    lazy_step steps[LAZY_MAX_STEPS];
+    int nsteps = 0;
+    luby_value source = luby_nil();
+    if (!lazy_collect_steps(L, argv[0], steps, &nsteps, &source)) return (int)LUBY_E_RUNTIME;
+
+    int was_paused = L->gc_paused; L->gc_paused = 1;
+    luby_value result = luby_array_new(L);
+    int64_t count = 0;
+
+    if (source.type == LUBY_T_ARRAY && source.as.ptr) {
+        luby_array *arr = (luby_array *)source.as.ptr;
+        for (size_t i = 0; i < arr->count && count < limit; i++) {
+            luby_value elem = arr->items[i];
+            int r = lazy_process_element(L, &elem, steps, nsteps);
+            if (r == 0) { luby_array_push_value(L, result, elem); count++; }
+            if (r == 2) break;
+        }
+    } else if (source.type == LUBY_T_RANGE && source.as.ptr) {
+        luby_range *rng = (luby_range *)source.as.ptr;
+        if (rng->start.type == LUBY_T_INT && rng->end.type == LUBY_T_INT) {
+            int64_t start = rng->start.as.i;
+            int64_t end = rng->end.as.i;
+            if (rng->exclusive) end--;
+            for (int64_t i = start; i <= end && count < limit; i++) {
+                luby_value elem = luby_int(i);
+                int r = lazy_process_element(L, &elem, steps, nsteps);
+                if (r == 0) { luby_array_push_value(L, result, elem); count++; }
+                if (r == 2) break;
+            }
+        }
+    } else {
+        luby_value arr_val = luby_nil();
+        if (luby_invoke_method(L, source, "to_a", 0, NULL, &arr_val) == 0 &&
+            arr_val.type == LUBY_T_ARRAY && arr_val.as.ptr) {
+            luby_array *arr = (luby_array *)arr_val.as.ptr;
+            for (size_t i = 0; i < arr->count && count < limit; i++) {
+                luby_value elem = arr->items[i];
+                int r = lazy_process_element(L, &elem, steps, nsteps);
+                if (r == 0) { luby_array_push_value(L, result, elem); count++; }
+                if (r == 2) break;
+            }
+        }
+    }
+
+    L->gc_paused = was_paused;
+    if (out) *out = result;
+    return (int)LUBY_E_OK;
+}
+
 static int luby_array_map(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
     if (argc < 1 || argv[0].type != LUBY_T_ARRAY || !argv[0].as.ptr) return (int)LUBY_E_TYPE;
     luby_proc *block = (L && L->current_block.type == LUBY_T_PROC) ? (luby_proc *)L->current_block.as.ptr : NULL;
@@ -12009,6 +12491,16 @@ LUBY_API void luby_open_base(luby_state *L) {
     luby_register_function(L, "coroutine_new", luby_coroutine_new_cfunc);
     luby_register_function(L, "coroutine_resume", luby_coroutine_resume_cfunc);
     luby_register_function(L, "coroutine_alive", luby_coroutine_alive_cfunc);
+    luby_register_function(L, "fiber_new", luby_fiber_new_cfunc);
+    luby_register_function(L, "fiber_resume", luby_fiber_resume_cfunc);
+    luby_register_function(L, "fiber_yield", luby_fiber_yield_cfunc);
+    luby_register_function(L, "fiber_alive", luby_fiber_alive_cfunc);
+    luby_register_function(L, "lazy", luby_lazy_create);
+    luby_register_function(L, "lazy_create", luby_lazy_create);
+    luby_register_function(L, "lazy_chain", luby_lazy_chain);
+    luby_register_function(L, "lazy_to_a", luby_lazy_to_a);
+    luby_register_function(L, "lazy_each", luby_lazy_each);
+    luby_register_function(L, "lazy_first_n", luby_lazy_first_n);
     luby_register_function(L, "send", luby_base_send);
     luby_register_function(L, "public_send", luby_base_public_send);
     luby_register_function(L, "define_method", luby_base_define_method);
@@ -12249,6 +12741,37 @@ LUBY_API void luby_open_base(luby_state *L) {
             luby_clear_error(L);
         }
     }
+
+    /* ---- Fiber class ---- */
+    {
+        luby_class_obj *fiber_cls = luby_class_new(L, "Fiber", NULL);
+        if (fiber_cls) {
+            luby_value v; v.type = LUBY_T_CLASS; v.as.ptr = fiber_cls;
+            luby_string_view name = { "Fiber", 5 };
+            luby_set_global(L, name, v);
+            luby_eval(L,
+                "class Fiber\n"
+                " def self.new(&block)\n"
+                "  fiber_new(block)\n"
+                " end\n"
+                " def resume(val = nil)\n"
+                "  fiber_resume(self, val)\n"
+                " end\n"
+                " def self.yield(val = nil)\n"
+                "  fiber_yield(val)\n"
+                " end\n"
+                " def alive?()\n"
+                "  fiber_alive(self)\n"
+                " end\n"
+                "end\n",
+                0,
+                "<fiber>",
+                NULL);
+            luby_clear_error(L);
+        }
+    }
+
+    /* .lazy on Array/Range is handled by the 'lazy' cfunc registered above */
 
     /* ---- Comparable module ---- */
     {
@@ -12650,8 +13173,165 @@ LUBY_API void luby_open_base(luby_state *L) {
                 "    end\n"
                 "    result\n"
                 "  end\n"
+                "\n"
+                "  def lazy\n"
+                "    lazy_create(self)\n"
+                "  end\n"
                 "end\n",
                 0, "<enumerable>", NULL);
+            luby_clear_error(L);
+        }
+    }
+
+    /* ---- Lazy class ---- */
+    {
+        luby_class_obj *lazy_cls = lazy_get_class(L);
+        if (lazy_cls) {
+            luby_eval(L,
+                "class Lazy\n"
+                " def map(&__blk)\n"
+                "  lazy_chain(self, 1, __blk)\n"
+                " end\n"
+                " def collect(&__blk)\n"
+                "  lazy_chain(self, 1, __blk)\n"
+                " end\n"
+                " def select(&__blk)\n"
+                "  lazy_chain(self, 2, __blk)\n"
+                " end\n"
+                " def filter(&__blk)\n"
+                "  lazy_chain(self, 2, __blk)\n"
+                " end\n"
+                " def reject(&__blk)\n"
+                "  lazy_chain(self, 3, __blk)\n"
+                " end\n"
+                " def take(n)\n"
+                "  lazy_chain(self, 4, n)\n"
+                " end\n"
+                " def drop(n)\n"
+                "  lazy_chain(self, 5, n)\n"
+                " end\n"
+                " def flat_map(&__blk)\n"
+                "  lazy_chain(self, 6, __blk)\n"
+                " end\n"
+                " def to_a\n"
+                "  lazy_to_a(self)\n"
+                " end\n"
+                " def force\n"
+                "  lazy_to_a(self)\n"
+                " end\n"
+                " def each\n"
+                "  __arr = lazy_to_a(self)\n"
+                "  __i = 0\n"
+                "  while __i < length(__arr)\n"
+                "    yield __arr[__i]\n"
+                "    __i = __i + 1\n"
+                "  end\n"
+                "  __arr\n"
+                " end\n"
+                " def first(n = nil)\n"
+                "  if n\n"
+                "    lazy_first_n(self, n)\n"
+                "  else\n"
+                "    r = lazy_first_n(self, 1)\n"
+                "    r[0]\n"
+                "  end\n"
+                " end\n"
+                " def include?(val)\n"
+                "  found = false\n"
+                "  lazy_each(self) { |x|\n"
+                "    if x == val\n"
+                "      found = true\n"
+                "    end\n"
+                "  }\n"
+                "  found\n"
+                " end\n"
+                " def any?(&__blk)\n"
+                "  found = false\n"
+                "  lazy_each(self) { |x|\n"
+                "    __v = __blk ? __blk.call(x) : x\n"
+                "    if __v\n"
+                "      found = true\n"
+                "    end\n"
+                "  }\n"
+                "  found\n"
+                " end\n"
+                " def all?(&__blk)\n"
+                "  result = true\n"
+                "  lazy_each(self) { |x|\n"
+                "    __v = __blk ? __blk.call(x) : x\n"
+                "    if !__v\n"
+                "      result = false\n"
+                "    end\n"
+                "  }\n"
+                "  result\n"
+                " end\n"
+                " def none?(&__blk)\n"
+                "  result = true\n"
+                "  lazy_each(self) { |x|\n"
+                "    __v = __blk ? __blk.call(x) : x\n"
+                "    if __v\n"
+                "      result = false\n"
+                "    end\n"
+                "  }\n"
+                "  result\n"
+                " end\n"
+                " def count(&__blk)\n"
+                "  n = 0\n"
+                "  if __blk\n"
+                "    lazy_each(self) { |x|\n"
+                "      if __blk.call(x)\n"
+                "        n = n + 1\n"
+                "      end\n"
+                "    }\n"
+                "  else\n"
+                "    lazy_each(self) { |x| n = n + 1 }\n"
+                "  end\n"
+                "  n\n"
+                " end\n"
+                " def min\n"
+                "  best = nil\n"
+                "  lazy_each(self) { |x|\n"
+                "    if best == nil || x < best\n"
+                "      best = x\n"
+                "    end\n"
+                "  }\n"
+                "  best\n"
+                " end\n"
+                " def max\n"
+                "  best = nil\n"
+                "  lazy_each(self) { |x|\n"
+                "    if best == nil || x > best\n"
+                "      best = x\n"
+                "    end\n"
+                "  }\n"
+                "  best\n"
+                " end\n"
+                " def sum(init = 0)\n"
+                "  acc = init\n"
+                "  lazy_each(self) { |x| acc = acc + x }\n"
+                "  acc\n"
+                " end\n"
+                " def reduce(init, &__blk)\n"
+                "  acc = init\n"
+                "  lazy_each(self) { |x| acc = __blk.call(acc, x) }\n"
+                "  acc\n"
+                " end\n"
+                " def find(&__blk)\n"
+                "  found = nil\n"
+                "  done = false\n"
+                "  lazy_each(self) { |x|\n"
+                "    if !done && __blk.call(x)\n"
+                "      found = x\n"
+                "      done = true\n"
+                "    end\n"
+                "  }\n"
+                "  found\n"
+                " end\n"
+                " def lazy\n"
+                "  self\n"
+                " end\n"
+                "end\n",
+                0, "<lazy>", NULL);
             luby_clear_error(L);
         }
     }

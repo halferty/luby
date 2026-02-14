@@ -191,6 +191,62 @@ The `included` hook is called when a module is mixed in.
 
 ---
 
+## Struct
+
+```ruby
+Point = Struct.new(:x, :y)
+p = Point.new(10, 20)
+p.x            #=> 10
+p.to_a         #=> [10, 20]
+p.to_h         #=> { x: 10, y: 20 }
+p.members      #=> [:x, :y]
+p == Point.new(10, 20)  #=> true
+```
+
+Struct classes automatically get `initialize`, readers, writers, `[]`, `[]=`, `each`, `to_s`, `==`, `to_a`, `to_h`, and `members`.
+
+---
+
+## Comparable
+
+Include `Comparable` and define `<=>` to get `<`, `<=`, `==`, `>`, `>=`, `between?`, and `clamp`:
+
+```ruby
+class Temperature
+  include Comparable
+  attr_reader :deg
+  def initialize(d); @deg = d; end
+  def <=>(other); @deg <=> other.deg; end
+end
+
+Temperature.new(50) > Temperature.new(30)   #=> true
+Temperature.new(10).between?(Temperature.new(0), Temperature.new(20))  #=> true
+```
+
+---
+
+## Enumerable
+
+Include `Enumerable` and define `each` to get 30 iteration methods:
+
+```ruby
+class NumberList
+  include Enumerable
+  def initialize(*nums); @nums = nums; end
+  def each(&block); @nums.each(&block); end
+end
+
+list = NumberList.new(3, 1, 2)
+list.sort          #=> [1, 2, 3]
+list.map { |n| n * 2 }  #=> [6, 2, 4]
+list.min           #=> 1
+list.any? { |n| n > 2 } #=> true
+```
+
+Methods include: `to_a`, `map`/`collect`, `select`, `reject`, `find`, `count`, `include?`, `min`, `max`, `sum`, `reduce`, `any?`, `all?`, `none?`, `min_by`, `max_by`, `sort`, `sort_by`, `flat_map`, `each_with_index`, `first`, `take`, `drop`, `group_by`, `tally`, `zip`, `each_with_object`, `entries`.
+
+---
+
 ## Singleton Methods
 
 ```ruby
@@ -260,6 +316,118 @@ end
 
 ---
 
+## Fibers
+
+Fibers provide cooperative concurrency — a fiber runs until it yields, then control returns to the caller.
+
+```ruby
+f = Fiber.new { |x|
+  Fiber.yield(x + 1)
+  x + 2
+}
+
+f.resume(10)  #=> 11  (yielded value)
+f.resume      #=> 12  (return value)
+f.alive?      #=> false
+```
+
+Bidirectional value passing:
+
+```ruby
+f = Fiber.new {
+  val = Fiber.yield(1)   # yield 1, receive value from next resume
+  val * 10
+}
+f.resume        #=> 1
+f.resume(5)     #=> 50
+```
+
+Infinite generators:
+
+```ruby
+fib = Fiber.new {
+  a, b = 0, 1
+  loop do
+    Fiber.yield(a)
+    a, b = b, a + b
+  end
+}
+
+10.times { puts fib.resume }  # prints first 10 Fibonacci numbers
+```
+
+The `yield` keyword also works inside fibers (equivalent to `Fiber.yield`).
+
+---
+
+## Lazy Enumerators
+
+Call `.lazy` on an Array or Range (or any Enumerable) to get a `Lazy` object that chains transforms without evaluating them until forced:
+
+```ruby
+# Build a pipeline — nothing runs yet
+lazy = (1..1000000).lazy.select { |x| x % 2 == 0 }.map { |x| x * 10 }.take(5)
+
+lazy.to_a    #=> [20, 40, 60, 80, 100]   — only 10 elements examined
+lazy.force   #=> same as to_a
+```
+
+### Chainable methods
+
+| Method | Description |
+|--------|-------------|
+| `map { \|x\| ... }` / `collect` | Transform each element |
+| `select { \|x\| ... }` / `filter` | Keep elements where block is truthy |
+| `reject { \|x\| ... }` | Drop elements where block is truthy |
+| `take(n)` | Stop after *n* elements (short-circuits) |
+| `drop(n)` | Skip the first *n* elements |
+| `flat_map { \|x\| ... }` | Map then flatten one level |
+| `lazy` | Returns self (no-op on Lazy) |
+
+### Forcing / consuming
+
+| Method | Description |
+|--------|-------------|
+| `to_a` / `force` | Materialize the pipeline into an Array |
+| `each { \|x\| ... }` | Iterate the pipeline, yielding to the block |
+| `first` / `first(n)` | First element or first *n* elements |
+| `count`, `sum`, `min`, `max` | Aggregate the pipeline |
+| `reduce(init) { \|acc, x\| ... }` | Fold |
+| `find { \|x\| ... }` | First matching element |
+| `any?`, `all?`, `none?`, `include?` | Boolean queries |
+
+### Custom Enumerable classes
+
+Any class that includes `Enumerable` and defines `each` automatically gets a `.lazy` method:
+
+```ruby
+class Evens
+  include Enumerable
+  def each
+    n = 0
+    loop { yield n; n = n + 2 }
+  end
+end
+
+# Evens.new.lazy.take(5).to_a  #=> [0, 2, 4, 6, 8]
+```
+
+---
+
+## Range
+
+```ruby
+(1..5).to_a       #=> [1, 2, 3, 4, 5]
+(1...5).to_a      #=> [1, 2, 3, 4]
+(1..5).include?(3) #=> true
+(1..10).size       #=> 10
+(1..5).each { |n| puts n }
+```
+
+`..` is inclusive, `...` is exclusive of the end value.
+
+---
+
 ## File Loading
 
 ```ruby
@@ -308,3 +476,18 @@ A non-exhaustive list of built-in methods available after `luby_open_base`:
 
 ### Class / Module
 `new`, `name`, `superclass`, `define_method`, `class_eval`, `instance_eval`, `include`, `ancestors`
+
+### Struct
+`new`, `members`, `to_a`, `to_h`, `[]`, `[]=`, `each`, `==`, `to_s`, plus generated reader/writer methods
+
+### Comparable (module)
+`<`, `<=`, `==`, `>`, `>=`, `between?`, `clamp` — requires `<=>` to be defined
+
+### Enumerable (module)
+`to_a`, `map`, `select`, `reject`, `find`, `count`, `include?`, `min`, `max`, `sum`, `reduce`, `any?`, `all?`, `none?`, `min_by`, `max_by`, `sort`, `sort_by`, `flat_map`, `each_with_index`, `first`, `take`, `drop`, `group_by`, `tally`, `zip`, `each_with_object`, `entries`, `collect` — requires `each` to be defined
+
+### Fiber
+`Fiber.new { }`, `Fiber.yield(val)`, `fiber.resume(val)`, `fiber.alive?`
+
+### Lazy (class)
+`map`, `collect`, `select`, `filter`, `reject`, `take`, `drop`, `flat_map`, `to_a`, `force`, `each`, `first`, `include?`, `any?`, `all?`, `none?`, `count`, `min`, `max`, `sum`, `reduce`, `find`, `lazy` — created via `.lazy` on Array, Range, or any Enumerable

@@ -239,6 +239,14 @@ luby_coroutine_resume(L, co, 0, NULL, &result, &yielded);
 // yielded == 1 if the coroutine yielded rather than returned
 ```
 
+For script-side cooperative concurrency, the `Fiber` class is available after `luby_open_base`:
+
+```ruby
+f = Fiber.new { Fiber.yield(1); 2 }
+f.resume  #=> 1
+f.resume  #=> 2
+```
+
 ---
 
 ## Error Handling

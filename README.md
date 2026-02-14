@@ -13,7 +13,11 @@ Luby brings a familiar Ruby-inspired syntax to C and C++ applications. It ships 
 - **Metaprogramming** — `method_missing`, `define_method`, `class_eval`, `instance_eval`, `send`
 - **Core types** — Integer, Float, String, Symbol, Array, Hash, Proc, Class, Module
 - **Blocks & iterators** — closures, `yield`, chainable Enumerable methods (`map`, `select`, `reduce`, …)
-- **Coroutines** — cooperative multitasking with yield/resume from the host
+- **Struct** — `Struct.new(:x, :y)` with generated accessors, `to_a`, `to_h`, `==`, `each`, `to_s`
+- **Comparable & Enumerable** — mix-in modules just like Ruby (`<=>`, `sort_by`, `min_by`, `group_by`, …)
+- **Lazy enumerators** — `[1,2,3].lazy.select { }.map { }.take(5)` with short-circuit evaluation
+- **Fibers** — `Fiber.new`, `Fiber.yield`, `fiber.resume` for cooperative concurrency from script code
+- **Coroutines** — cooperative multitasking with yield/resume from the host C API
 - **Virtual file system** — `require`/`load` go through embedder-provided callbacks
 - **Debug hooks** — line, call, and return hooks for profiling and debugging
 - **Custom allocator** — plug in your own memory allocator
