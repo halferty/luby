@@ -545,6 +545,12 @@ typedef struct luby_config {
     luby_alloc_fn alloc;  // if NULL, uses malloc/realloc/free
     void *alloc_user;
     luby_vfs vfs;
+    
+    // Execution limits (0 = unlimited)
+    size_t instruction_limit;   // Max bytecode instructions per invocation
+    size_t call_depth_limit;    // Max call stack depth
+    size_t allocation_limit;    // Max GC allocations per invocation
+    size_t memory_limit;        // Max GC heap size in bytes
 } luby_config;
 
 // --------------------------- Native Bindings -------------------------------
@@ -554,6 +560,16 @@ typedef void (*luby_finalizer)(void *user_data);
 
 LUBY_API luby_state *luby_new(const luby_config *cfg);
 LUBY_API void luby_free(luby_state *L);
+
+// Execution limits
+LUBY_API void luby_set_instruction_limit(luby_state *L, size_t limit);
+LUBY_API void luby_set_call_depth_limit(luby_state *L, size_t limit);
+LUBY_API void luby_set_allocation_limit(luby_state *L, size_t limit);
+LUBY_API void luby_set_memory_limit(luby_state *L, size_t limit);
+LUBY_API size_t luby_get_instruction_count(luby_state *L);
+LUBY_API size_t luby_get_allocation_count(luby_state *L);
+LUBY_API size_t luby_get_memory_usage(luby_state *L);
+LUBY_API size_t luby_get_peak_memory_usage(luby_state *L);
 
 LUBY_API int luby_eval(luby_state *L, const char *code, size_t len, const char *filename, luby_value *out);
 LUBY_API int luby_require(luby_state *L, const char *path, luby_value *out);
@@ -694,6 +710,20 @@ struct luby_state {
     size_t gc_threshold;           // trigger collection when gc_alloc_count reaches this
     size_t gc_total;               // total number of live GC objects
     int gc_paused;                 // if non-zero, GC collection is inhibited
+    
+    // Execution limits (from config)
+    size_t instruction_limit;      // Max instructions per invocation (0 = unlimited)
+    size_t call_depth_limit;       // Max call stack depth (0 = unlimited)
+    size_t allocation_limit;       // Max allocations per invocation (0 = unlimited)
+    size_t memory_limit;           // Max GC heap size in bytes (0 = unlimited)
+    
+    // Execution tracking (per-invocation counters reset on each C entry)
+    size_t instruction_count;      // Instructions executed this invocation
+    size_t allocation_count;       // Allocations made this invocation
+    
+    // Memory tracking (persistent across invocations)
+    size_t gc_bytes_allocated;     // Current GC heap size in bytes
+    size_t peak_gc_bytes;          // Peak GC heap usage (for profiling)
 
     // Block break signaling
     int block_break;               // set by OP_BLOCK_BREAK
@@ -789,6 +819,7 @@ typedef struct luby_object {
     char **ivar_names;
     luby_value *ivar_values;
     size_t ivar_count;
+    luby_gc_obj *native_ref;    // optional GC-traced native reference (e.g., coroutine)
 } luby_object;
 
 typedef struct luby_range {
@@ -934,6 +965,7 @@ static void luby_free_node(luby_state *L, void *node) {
 #define LUBY_GC_INITIAL_THRESHOLD 256
 
 static void luby_gc_collect(luby_state *L);
+static void luby_set_error(luby_state *L, luby_error_code code, const char *message, const char *file, int line, int column);
 
 // Track a GC object: link into intrusive list and bump counters.
 static void luby_gc_track(luby_state *L, luby_gc_obj *obj, luby_gc_type type) {
@@ -948,12 +980,40 @@ static void luby_gc_track(luby_state *L, luby_gc_obj *obj, luby_gc_type type) {
 // Allocate a GC-tracked object of given size and type.  Triggers collection
 // when the allocation counter reaches the threshold.
 static void *luby_gc_alloc(luby_state *L, size_t size, luby_gc_type type) {
+    // Check allocation count limit (per-invocation)
+    L->allocation_count++;
+    if (L->allocation_limit > 0 && L->allocation_count > L->allocation_limit) {
+        luby_set_error(L, LUBY_E_RUNTIME, "allocation limit exceeded", NULL, 0, 0);
+        return NULL;
+    }
+    
+    // Check memory limit (persistent) - try GC first if close to limit
+    if (L->memory_limit > 0 && L->gc_bytes_allocated + size > L->memory_limit) {
+        if (!L->gc_paused) {
+            luby_gc_collect(L);
+        }
+        // Check again after GC
+        if (L->gc_bytes_allocated + size > L->memory_limit) {
+            luby_set_error(L, LUBY_E_RUNTIME, "memory limit exceeded", NULL, 0, 0);
+            return NULL;
+        }
+    }
+    
+    // Normal GC threshold check
     if (!L->gc_paused && L->gc_alloc_count >= L->gc_threshold) {
         luby_gc_collect(L);
     }
+    
     void *mem = luby_alloc_raw(L, NULL, size);
     if (!mem) return NULL;
     memset(mem, 0, size);
+    
+    // Track memory usage
+    L->gc_bytes_allocated += size;
+    if (L->gc_bytes_allocated > L->peak_gc_bytes) {
+        L->peak_gc_bytes = L->gc_bytes_allocated;
+    }
+    
     luby_gc_track(L, (luby_gc_obj *)mem, type);
     return mem;
 }
@@ -962,15 +1022,45 @@ static void *luby_gc_alloc(luby_state *L, size_t size, luby_gc_type type) {
 // Returns pointer to the char data (not the header), so it's a
 // drop-in replacement for luby_dup_string in luby_value.as.ptr.
 static char *luby_gc_alloc_string(luby_state *L, const char *data, size_t len) {
+    size_t total_size = sizeof(luby_string_obj) + len + 1;
+    
+    // Check allocation count limit (per-invocation)
+    L->allocation_count++;
+    if (L->allocation_limit > 0 && L->allocation_count > L->allocation_limit) {
+        luby_set_error(L, LUBY_E_RUNTIME, "allocation limit exceeded", NULL, 0, 0);
+        return NULL;
+    }
+    
+    // Check memory limit (persistent) - try GC first if close to limit
+    if (L->memory_limit > 0 && L->gc_bytes_allocated + total_size > L->memory_limit) {
+        if (!L->gc_paused) {
+            luby_gc_collect(L);
+        }
+        // Check again after GC
+        if (L->gc_bytes_allocated + total_size > L->memory_limit) {
+            luby_set_error(L, LUBY_E_RUNTIME, "memory limit exceeded", NULL, 0, 0);
+            return NULL;
+        }
+    }
+    
+    // Normal GC threshold check
     if (!L->gc_paused && L->gc_alloc_count >= L->gc_threshold) {
         luby_gc_collect(L);
     }
-    luby_string_obj *s = (luby_string_obj *)luby_alloc_raw(L, NULL, sizeof(luby_string_obj) + len + 1);
+    
+    luby_string_obj *s = (luby_string_obj *)luby_alloc_raw(L, NULL, total_size);
     if (!s) return NULL;
     memset(s, 0, sizeof(luby_string_obj));
     s->length = len;
     if (data) memcpy(s->data, data, len);
     s->data[len] = '\0';
+    
+    // Track memory usage
+    L->gc_bytes_allocated += total_size;
+    if (L->gc_bytes_allocated > L->peak_gc_bytes) {
+        L->peak_gc_bytes = L->gc_bytes_allocated;
+    }
+    
     luby_gc_track(L, &s->gc, LUBY_GC_STRING);
     return s->data;
 }
@@ -1026,6 +1116,7 @@ static void luby_gc_mark_obj(luby_gc_obj *obj) {
             if (o->klass) luby_gc_mark_obj(&o->klass->gc);
             if (o->ivars) luby_gc_mark_obj(&o->ivars->gc);
             if (o->singleton_methods) luby_gc_mark_obj(&o->singleton_methods->gc);
+            if (o->native_ref) luby_gc_mark_obj(o->native_ref);
             for (size_t i = 0; i < o->ivar_count; i++) {
                 luby_gc_mark_value(o->ivar_values[i]);
             }
@@ -1191,7 +1282,43 @@ static void luby_gc_mark_roots(luby_state *L) {
 static void luby_vm_free(luby_state *L, luby_vm *vm);
 static void luby_proc_free(luby_state *L, luby_proc *proc);
 
+// Calculate approximate size of a GC object for memory tracking
+static size_t luby_gc_obj_size(luby_gc_obj *obj) {
+    switch (obj->gc_type) {
+        case LUBY_GC_STRING: {
+            luby_string_obj *s = (luby_string_obj *)obj;
+            return sizeof(luby_string_obj) + s->length + 1;
+        }
+        case LUBY_GC_ARRAY:
+            return sizeof(luby_array);
+        case LUBY_GC_HASH:
+            return sizeof(luby_hash);
+        case LUBY_GC_CLASS:
+            return sizeof(luby_class_obj);
+        case LUBY_GC_OBJECT:
+            return sizeof(luby_object);
+        case LUBY_GC_PROC:
+            return sizeof(luby_proc);
+        case LUBY_GC_RANGE:
+            return sizeof(luby_range);
+        case LUBY_GC_COROUTINE:
+            return sizeof(luby_coroutine);
+        case LUBY_GC_CMETHOD:
+            return sizeof(luby_cmethod);
+        case LUBY_GC_USERDATA:
+            return sizeof(luby_userdata);
+        default:
+            return 0;
+    }
+}
+
 static void luby_gc_free_obj(luby_state *L, luby_gc_obj *obj) {
+    // Decrement memory tracking before freeing
+    size_t obj_size = luby_gc_obj_size(obj);
+    if (L->gc_bytes_allocated >= obj_size) {
+        L->gc_bytes_allocated -= obj_size;
+    }
+    
     switch (obj->gc_type) {
         case LUBY_GC_STRING:
             // String obj is the allocation (data[] is flexible member)
@@ -1517,6 +1644,7 @@ static luby_object *luby_object_new(luby_state *L, luby_class_obj *cls) {
     obj->ivar_names = NULL;
     obj->ivar_values = NULL;
     obj->ivar_count = 0;
+    obj->native_ref = NULL;
     L->gc_paused = was_paused;
     return obj;
 }
@@ -4720,6 +4848,12 @@ static int luby_vm_push_frame(luby_state *L, luby_vm *vm, luby_proc *proc, luby_
     luby_value recv, luby_class_obj *method_class, const char *method_name, int argc, const luby_value *argv, luby_value block, int set_self) {
     if (!L || !vm || !chunk) return 0;
     if (!luby_vm_ensure_frames(L, vm)) return 0;
+    
+    // Check call depth limit
+    if (L->call_depth_limit > 0 && vm->frame_count >= L->call_depth_limit) {
+        luby_set_error(L, LUBY_E_RUNTIME, "stack overflow (call depth limit exceeded)", filename, 0, 0);
+        return 0;
+    }
 
     luby_vm_frame *f = &vm->frames[vm->frame_count++];
     memset(f, 0, sizeof(*f));
@@ -5003,6 +5137,14 @@ static int luby_vm_run(luby_state *L, luby_vm *vm, luby_value *out) {
     vm_continue: ;
             luby_inst inst = chunk->code[f->ip];
             int line = chunk->lines ? chunk->lines[f->ip] : 0;
+            
+            // Instruction counting for execution limits
+            L->instruction_count++;
+            if (L->instruction_limit > 0 && L->instruction_count > L->instruction_limit) {
+                luby_set_error(L, LUBY_E_RUNTIME, "instruction limit exceeded", f->filename, line, 0);
+                goto vm_error;
+            }
+            
             switch ((luby_op)inst.op) {
                 case LUBY_OP_CONST:
                     if (!luby_vm_ensure_stack(L, vm, 1)) { luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
@@ -5060,7 +5202,7 @@ static int luby_vm_run(luby_state *L, luby_vm *vm, luby_value *out) {
                         }
                     }
                     luby_class_obj *cls = luby_class_new(L, name, super);
-                    if (!cls) { luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
+                    if (!cls) { if (L->last_error.code == LUBY_E_OK) luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
                     if (super) {
                         luby_value superv; superv.type = LUBY_T_CLASS; superv.as.ptr = super;
                         luby_value cv; cv.type = LUBY_T_CLASS; cv.as.ptr = cls;
@@ -5084,7 +5226,7 @@ static int luby_vm_run(luby_state *L, luby_vm *vm, luby_value *out) {
                     } else {
                         mod = luby_class_new(L, name, NULL);
                     }
-                    if (!mod) { luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
+                    if (!mod) { if (L->last_error.code == LUBY_E_OK) luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
                     luby_value v; v.type = LUBY_T_MODULE; v.as.ptr = mod;
                     if (!luby_vm_ensure_stack(L, vm, 1)) { luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
                     vm->stack[vm->sp++] = v;
@@ -5151,7 +5293,9 @@ static int luby_vm_run(luby_state *L, luby_vm *vm, luby_value *out) {
                                 luby_value block = L->current_block;
                                 f->ip++;
                                 if (!luby_vm_push_frame(L, vm, m, &m->chunk, "<method>", L->current_self, cls, name.data, 0, NULL, block, 1)) {
-                                    luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0);
+                                    if (L->last_error.code == LUBY_E_OK) {
+                                        luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0);
+                                    }
                                     goto vm_error;
                                 }
                                 goto vm_next_frame;
@@ -5209,7 +5353,7 @@ static int luby_vm_run(luby_state *L, luby_vm *vm, luby_value *out) {
                             if (sa_tmp) luby_alloc_raw(L, sa_tmp, 0);
                             if (sb_tmp) luby_alloc_raw(L, sb_tmp, 0);
                             L->gc_paused = was_paused;
-                            luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error;
+                            if (L->last_error.code == LUBY_E_OK) luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error;
                         }
                         memcpy(buf, sa, la);
                         memcpy(buf + la, sb, lb);
@@ -5227,7 +5371,7 @@ static int luby_vm_run(luby_state *L, luby_vm *vm, luby_value *out) {
                         int was_paused = L->gc_paused;
                         L->gc_paused = 1;
                         luby_array *ra = (luby_array *)luby_gc_alloc(L, sizeof(luby_array), LUBY_GC_ARRAY);
-                        if (!ra) { L->gc_paused = was_paused; luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
+                        if (!ra) { L->gc_paused = was_paused; if (L->last_error.code == LUBY_E_OK) luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
                         ra->count = ac + bc; ra->capacity = ac + bc > 0 ? ac + bc : 1; ra->frozen = 0;
                         ra->items = (luby_value *)luby_alloc_raw(L, NULL, ra->capacity * sizeof(luby_value));
                         if (ac > 0) memcpy(ra->items, aa->items, ac * sizeof(luby_value));
@@ -5360,12 +5504,12 @@ static int luby_vm_run(luby_state *L, luby_vm *vm, luby_value *out) {
                 case LUBY_OP_MAKE_ARRAY: {
                     uint8_t count = inst.a;
                     luby_array *arr = (luby_array *)luby_gc_alloc(L, sizeof(luby_array), LUBY_GC_ARRAY);
-                    if (!arr) { luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
+                    if (!arr) { if (L->last_error.code == LUBY_E_OK) luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
                     arr->count = count;
                     arr->capacity = count;
                     arr->items = (luby_value *)luby_alloc_raw(L, NULL, count * sizeof(luby_value));
                     arr->frozen = 0;
-                    if (!arr->items && count > 0) { luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
+                    if (!arr->items && count > 0) { if (L->last_error.code == LUBY_E_OK) luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
                     for (int i = (int)count - 1; i >= 0; i--) {
                         arr->items[i] = (vm->sp > f->stack_base) ? vm->stack[--vm->sp] : luby_nil();
                     }
@@ -5377,12 +5521,12 @@ static int luby_vm_run(luby_state *L, luby_vm *vm, luby_value *out) {
                 case LUBY_OP_MAKE_HASH: {
                     uint8_t count = inst.a;
                     luby_hash *h = (luby_hash *)luby_gc_alloc(L, sizeof(luby_hash), LUBY_GC_HASH);
-                    if (!h) { luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
+                    if (!h) { if (L->last_error.code == LUBY_E_OK) luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
                     h->count = count;
                     h->capacity = count;
                     h->entries = (luby_hash_entry *)luby_alloc_raw(L, NULL, count * sizeof(luby_hash_entry));
                     h->frozen = 0;
-                    if (!h->entries && count > 0) { luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
+                    if (!h->entries && count > 0) { if (L->last_error.code == LUBY_E_OK) luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
                     for (int i = (int)count - 1; i >= 0; i--) {
                         luby_value val = (vm->sp > f->stack_base) ? vm->stack[--vm->sp] : luby_nil();
                         luby_value key = (vm->sp > f->stack_base) ? vm->stack[--vm->sp] : luby_nil();
@@ -5560,7 +5704,9 @@ set_index_done:
                         L->current_block = L->saved_block_for_call;
                         f->ip++;
                         if (!luby_vm_push_frame(L, vm, sm, &sm->chunk, "<super>", L->current_self, L->current_method_class->super, mname, use, args, block, 1)) {
-                            luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0);
+                            if (L->last_error.code == LUBY_E_OK) {
+                                luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0);
+                            }
                             goto vm_error;
                         }
                         goto vm_next_frame;
@@ -5577,7 +5723,9 @@ set_index_done:
                             L->current_block = L->saved_block_for_call;
                             f->ip++;
                             if (!luby_vm_push_frame(L, vm, proc, &proc->chunk, "<proc>", luby_nil(), NULL, NULL, use - 1, args + 1, block, 0)) {
-                                luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0);
+                                if (L->last_error.code == LUBY_E_OK) {
+                                    luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0);
+                                }
                                 goto vm_error;
                             }
                             goto vm_next_frame;
@@ -5593,7 +5741,9 @@ set_index_done:
                                     L->current_block = L->saved_block_for_call;
                                     f->ip++;
                                     if (!luby_vm_push_frame(L, vm, new_sp, &new_sp->chunk, "<new>", recv, cls, "new", use - 1, args + 1, block, 1)) {
-                                        luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0);
+                                        if (L->last_error.code == LUBY_E_OK) {
+                                            luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0);
+                                        }
                                         goto vm_error;
                                     }
                                     goto vm_next_frame;
@@ -5611,7 +5761,7 @@ set_index_done:
                                     break;
                                 }
                                 luby_object *obj = luby_object_new(L, cls);
-                                if (!obj) { luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
+                                if (!obj) { if (L->last_error.code == LUBY_E_OK) luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
                                 r.type = LUBY_T_OBJECT; r.as.ptr = obj;
                                 // Check for initialize method and call it
                                 luby_proc *init = luby_class_get_method(L, cls, "initialize");
@@ -5627,7 +5777,9 @@ set_index_done:
                                     // Save obj in a temp, call init, then push obj
                                     // For now, push frame for initialize with obj as self
                                     if (!luby_vm_push_frame(L, vm, init, &init->chunk, "<initialize>", r, cls, "initialize", use - 1, args + 1, block, 1)) {
-                                        luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0);
+                                        if (L->last_error.code == LUBY_E_OK) {
+                                            luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0);
+                                        }
                                         goto vm_error;
                                     }
                                     // Mark that we should return obj, not init's return value
@@ -5654,7 +5806,9 @@ set_index_done:
                                     L->current_block = L->saved_block_for_call;
                                     f->ip++;
                                     if (!luby_vm_push_frame(L, vm, m, &m->chunk, "<method>", recv, cls, fname, use - 1, args + 1, block, 1)) {
-                                        luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0);
+                                        if (L->last_error.code == LUBY_E_OK) {
+                                            luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0);
+                                        }
                                         goto vm_error;
                                     }
                                     goto vm_next_frame;
@@ -5686,7 +5840,9 @@ set_index_done:
                                         L->current_block = L->saved_block_for_call;
                                         f->ip++;
                                         if (!luby_vm_push_frame(L, vm, sm, &sm->chunk, "<super>", L->current_self, start, mname, use, args, block, 1)) {
-                                            luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0);
+                                            if (L->last_error.code == LUBY_E_OK) {
+                                                luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0);
+                                            }
                                             goto vm_error;
                                         }
                                         goto vm_next_frame;
@@ -5709,7 +5865,9 @@ set_index_done:
                                         L->current_block = L->saved_block_for_call;
                                         f->ip++;
                                         if (!luby_vm_push_frame(L, vm, mm, &mm->chunk, "<method_missing>", recv, cls, "method_missing", mcount - 1, mm_args + 1, block, 1)) {
-                                            luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0);
+                                            if (L->last_error.code == LUBY_E_OK) {
+                                                luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0);
+                                            }
                                             goto vm_error;
                                         }
                                         goto vm_next_frame;
@@ -5752,7 +5910,9 @@ set_index_done:
                             L->current_block = L->saved_block_for_call;
                             f->ip++;
                             if (!luby_vm_push_frame(L, vm, gp, &gp->chunk, "<proc>", luby_nil(), NULL, fname, use, args, block, 0)) {
-                                luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0);
+                                if (L->last_error.code == LUBY_E_OK) {
+                                    luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0);
+                                }
                                 goto vm_error;
                             }
                             goto vm_next_frame;
@@ -5798,7 +5958,9 @@ set_index_done:
                                 L->current_block = L->saved_block_for_call;
                                 f->ip++;
                                 if (!luby_vm_push_frame(L, vm, m, &m->chunk, "<method>", L->current_self, cls, fname, use, args, block, 1)) {
-                                    luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0);
+                                    if (L->last_error.code == LUBY_E_OK) {
+                                        luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0);
+                                    }
                                     goto vm_error;
                                 }
                                 goto vm_next_frame;
@@ -5894,7 +6056,9 @@ set_index_done:
                     luby_value block = luby_nil();
                     f->ip++;
                     if (!luby_vm_push_frame(L, vm, bp, &bp->chunk, "<block>", luby_nil(), NULL, NULL, use, yargs, block, 0)) {
-                        luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0);
+                        if (L->last_error.code == LUBY_E_OK) {
+                            luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0);
+                        }
                         goto vm_error;
                     }
                     goto vm_next_frame;
@@ -5925,7 +6089,7 @@ set_index_done:
 
                     // Allocate result string (GC-tracked)
                     char *result = luby_gc_alloc_string(L, NULL, total_len);
-                    if (!result) { luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
+                    if (!result) { if (L->last_error.code == LUBY_E_OK) luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
 
                     // Concatenate
                     char *p = result;
@@ -6197,7 +6361,7 @@ set_index_done:
                     int exclusive = inst.a;
                     // Create range object
                     luby_range *range = (luby_range *)luby_gc_alloc(L, sizeof(luby_range), LUBY_GC_RANGE);
-                    if (!range) { luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
+                    if (!range) { if (L->last_error.code == LUBY_E_OK) luby_set_error(L, LUBY_E_OOM, "oom", f->filename, line, 0); goto vm_error; }
                     range->start = start_val;
                     range->end = end_val;
                     range->exclusive = exclusive;
@@ -7243,6 +7407,16 @@ LUBY_API luby_state *luby_new(const luby_config *cfg) {
     L->rng_state[1] = 0xda3e39cb94b95bdbULL;
     // Initialize GC
     L->gc_threshold = LUBY_GC_INITIAL_THRESHOLD;
+    // Copy execution limits from config
+    L->instruction_limit = cfg ? cfg->instruction_limit : 0;
+    L->call_depth_limit = cfg ? cfg->call_depth_limit : 0;
+    L->allocation_limit = cfg ? cfg->allocation_limit : 0;
+    L->memory_limit = cfg ? cfg->memory_limit : 0;
+    // Counters start at zero (memset already did this, but be explicit)
+    L->instruction_count = 0;
+    L->allocation_count = 0;
+    L->gc_bytes_allocated = 0;
+    L->peak_gc_bytes = 0;
     return L;
 }
 
@@ -7281,6 +7455,42 @@ LUBY_API void luby_free(luby_state *L) {
     luby_default_alloc(NULL, L, 0);
 }
 
+// ------------------------------ Execution Limits API -----------------------
+
+LUBY_API void luby_set_instruction_limit(luby_state *L, size_t limit) {
+    if (L) L->instruction_limit = limit;
+}
+
+LUBY_API void luby_set_call_depth_limit(luby_state *L, size_t limit) {
+    if (L) L->call_depth_limit = limit;
+}
+
+LUBY_API void luby_set_allocation_limit(luby_state *L, size_t limit) {
+    if (L) L->allocation_limit = limit;
+}
+
+LUBY_API void luby_set_memory_limit(luby_state *L, size_t limit) {
+    if (L) L->memory_limit = limit;
+}
+
+LUBY_API size_t luby_get_instruction_count(luby_state *L) {
+    return L ? L->instruction_count : 0;
+}
+
+LUBY_API size_t luby_get_allocation_count(luby_state *L) {
+    return L ? L->allocation_count : 0;
+}
+
+LUBY_API size_t luby_get_memory_usage(luby_state *L) {
+    return L ? L->gc_bytes_allocated : 0;
+}
+
+LUBY_API size_t luby_get_peak_memory_usage(luby_state *L) {
+    return L ? L->peak_gc_bytes : 0;
+}
+
+// ------------------------------ Chunk Execution ----------------------------
+
 static int luby_execute_chunk(luby_state *L, luby_chunk *chunk, luby_value *out, const char *filename) {
     luby_value saved_sbfc = L->saved_block_for_call;
     luby_vm vm;
@@ -7289,7 +7499,7 @@ static int luby_execute_chunk(luby_state *L, luby_chunk *chunk, luby_value *out,
     if (!luby_vm_push_frame(L, &vm, NULL, chunk, filename, luby_nil(), NULL, NULL, 0, NULL, luby_nil(), 0)) {
         luby_vm_free(L, &vm);
         L->saved_block_for_call = saved_sbfc;
-        return (int)LUBY_E_OOM;
+        return (L->last_error.code != LUBY_E_OK) ? (int)L->last_error.code : (int)LUBY_E_OOM;
     }
     int rc = luby_vm_run(L, &vm, out);
     luby_vm_free(L, &vm);
@@ -7329,7 +7539,7 @@ static int luby_call_block(luby_state *L, luby_proc *proc, int argc, const luby_
         luby_vm_free(L, &vm);
         L->current_block = saved_block;
         L->saved_block_for_call = saved_sbfc;
-        return (int)LUBY_E_OOM;
+        return (L->last_error.code != LUBY_E_OK) ? (int)L->last_error.code : (int)LUBY_E_OOM;
     }
     int rc = luby_vm_run(L, &vm, out);
     luby_vm_free(L, &vm);
@@ -7355,7 +7565,7 @@ static int luby_call_proc_with_self(luby_state *L, luby_proc *proc, luby_value r
         luby_vm_free(L, &vm);
         L->current_block = saved_block;
         L->saved_block_for_call = saved_sbfc;
-        return (int)LUBY_E_OOM;
+        return (L->last_error.code != LUBY_E_OK) ? (int)L->last_error.code : (int)LUBY_E_OOM;
     }
     int rc = luby_vm_run(L, &vm, out);
     luby_vm_free(L, &vm);
@@ -7388,6 +7598,10 @@ static int luby_eval_with_context(luby_state *L, luby_value new_class, luby_valu
 
 LUBY_API int luby_eval(luby_state *L, const char *code, size_t len, const char *filename, luby_value *out) {
     luby_clear_error(L);
+    
+    // Reset per-invocation counters
+    L->instruction_count = 0;
+    L->allocation_count = 0;
     
     // Set up arena for fast AST allocation
     luby_arena arena;
@@ -7777,7 +7991,7 @@ LUBY_API int luby_invoke_global(luby_state *L, const char *name, int argc, const
             L->current_vm = saved_vm;
             luby_vm_free(L, &vm);
             L->saved_block_for_call = saved_sbfc;
-            return (int)LUBY_E_OOM;
+            return (L->last_error.code != LUBY_E_OK) ? (int)L->last_error.code : (int)LUBY_E_OOM;
         }
         
         int rc = luby_vm_run(L, &vm, out);
@@ -7825,7 +8039,7 @@ LUBY_API int luby_invoke_method(luby_state *L, luby_value recv, const char *meth
                 L->current_vm = saved_vm;
                 luby_vm_free(L, &vm);
                 L->saved_block_for_call = saved_sbfc;
-                return (int)LUBY_E_OOM;
+                return (L->last_error.code != LUBY_E_OK) ? (int)L->last_error.code : (int)LUBY_E_OOM;
             }
             
             int rc = luby_vm_run(L, &vm, out);
@@ -8252,6 +8466,7 @@ static int luby_fiber_new_cfunc(luby_state *L, int argc, const luby_value *argv,
     }
     luby_object *obj = luby_object_new(L, cls);
     if (!obj) return (int)LUBY_E_OOM;
+    obj->native_ref = &co->gc;  // GC-traceable reference to keep coroutine alive
     luby_value ov; ov.type = LUBY_T_OBJECT; ov.as.ptr = obj;
 
     luby_value key_ptr = luby_symbol(L, "_co_ptr", 0);
@@ -13808,11 +14023,15 @@ LUBY_API luby_coroutine *luby_coroutine_new(luby_state *L, luby_value func) {
 LUBY_API int luby_coroutine_resume(luby_state *L, luby_coroutine *co, int argc, const luby_value *argv, luby_value *out, int *out_yielded) {
     if (!co || !co->proc) { if (out) *out = luby_nil(); if (out_yielded) *out_yielded = 0; return (int)LUBY_E_TYPE; }
     if (co->done) { if (out) *out = luby_nil(); if (out_yielded) *out_yielded = 0; return (int)LUBY_E_OK; }
+    
+    // Reset per-invocation counters
+    L->instruction_count = 0;
+    L->allocation_count = 0;
 
     if (!co->started) {
         if (!luby_vm_ensure_stack(L, &co->vm, 1)) return (int)LUBY_E_OOM;
         if (!luby_vm_push_frame(L, &co->vm, co->proc, &co->proc->chunk, "<coroutine>", luby_nil(), NULL, NULL, argc, argv, luby_nil(), 0)) {
-            return (int)LUBY_E_OOM;
+            return (L->last_error.code != LUBY_E_OK) ? (int)L->last_error.code : (int)LUBY_E_OOM;
         }
         co->started = 1;
     } else {

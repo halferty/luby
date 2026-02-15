@@ -96,6 +96,7 @@ run_test "struct_enum"
 run_test "attr_methods"
 run_test "error_paths"
 run_test "method_name"
+run_test "exec_limits"
 
 # Summary
 echo "=================================="

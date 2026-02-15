@@ -3,6 +3,24 @@
 ## In Progress
 
 ## Planned
+- [ ] Bytecode caching
+- [ ] Vector2, Vector3, Quaternion, Matrix, Color types
+- [ ] Seeded random, gaussian/uniform distributions, shuffle, sample, rand
+- [ ] Easing/interpolation cubic/elastic/bounce
+- [ ] schedule/schedule_repeating run methods every N seconds, frame-based and time-based variants
+- [ ] coroutine enhancements - wait(sec) yield until time passes, wait_until { condition } yield until condition true, wait_frames(n) yield for N frames
+- [ ] set type
+- [ ] piority queue
+- [ ] object pooling
+- [ ] binary pack/unpack
+- [ ] json support
+- [ ] EventEmitter mixin or class, on(event, &handler), emit(event, data)
+- [ ] state machine helper
+- [ ] ECS pattern helpers
+- [ ] profiling hooks, function call counts, execution time per function, memory allocation tracking
+- [ ] Local variable inspection on stack traces, conditional breakpoints
+- [ ] Hot reloading, game state preserves across reloads
+
 
 ## Maybe Later
 - [p] Regex support (PUNT)
@@ -75,3 +93,4 @@
 - [x] GC fix: pause GC during compilation (compiled procs in chunk constants are not GC roots)
 - [x] `Fiber` class (`Fiber.new { }`, `fiber.resume(val)`, `Fiber.yield(val)`, `fiber.alive?`) — cooperative concurrency with bidirectional value passing, built on existing coroutine infrastructure via `luby_native_yield`
 - [x] Lazy enumerator (`[1,2,3].lazy`, `(1..100).lazy`) — chain-based pipeline with `map`, `select`, `reject`, `take`, `drop`, `flat_map`, `first`, and all consuming methods; short-circuits for `take`/`drop`/`first`
+- [x] Execution limits — 4 limit types for safe game scripting: instruction limit (per-invocation), call depth limit (stack overflow protection), allocation count limit (per-invocation), memory limit (persistent GC heap cap). Counters reset on each C→Ruby entry (`luby_eval`, `coroutine_resume`). Configurable via `luby_config` or dynamic API (`luby_set_instruction_limit`, `luby_set_call_depth_limit`, `luby_set_allocation_limit`, `luby_set_memory_limit`). Query functions: `luby_get_instruction_count`, `luby_get_allocation_count`, `luby_get_memory_usage`, `luby_get_peak_memory_usage`. Limits of 0 mean unlimited (backward compatible).
