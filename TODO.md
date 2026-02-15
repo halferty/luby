@@ -3,16 +3,6 @@
 ## In Progress
 
 ## Planned
-- [x] String + non-string auto-stringifies and concatenates (`"hello" + 42` → `"hello42"`)
-- [x] Integer/float division and modulo by zero raises `ZeroDivisionError`
-- [x] Inheriting from an undefined class raises `NameError`
-- [x] Implement `__method__`, `__callee__`, and `caller`
-- [ ] Alias `respond_to` to `respond_to?`
-- [ ] Implement `Object#inspect`
-- [ ] Implement `Object#object_id`
-- [ ] Implement `Class#name`, `Class#superclass`, `Class#ancestors`
-- [ ] Implement `Symbol#to_sym`
-- [ ] Implement `String#to_f`
 
 ## Maybe Later
 - [p] Regex support (PUNT)
@@ -52,6 +42,14 @@
 - [x] `attr_reader`, `attr_writer`, `attr_accessor`
 - [x] Numeric predicates (`zero?`, `positive?`, `negative?`, `even?`, `odd?`)
 - [x] Reflection (`is_a?`, `kind_of?`, `instance_of?`, `respond_to?`, `defined?`)
+- [x] `Object#inspect` - string representation suitable for debugging (shows strings with quotes, symbols with colons, objects with class and memory address)
+- [x] `Object#object_id` - unique identifier for each object (immediate values get deterministic IDs, heap objects use pointer address)
+- [x] `Class#name`, `Class#superclass`, `Class#ancestors` - class introspection methods
+- [x] `Symbol#to_sym` - returns self (a symbol is already a symbol)
+- [x] `String#to_f` - convert string to float (already implemented via base `to_f`)
+- [x] String + non-string auto-stringifies and concatenates (`"hello" + 42` → `"hello42"`)
+- [x] Integer/float division and modulo by zero raises `ZeroDivisionError`
+- [x] Inheriting from an undefined class raises `NameError`
 - [x] Class variables (`@@var`)
 - [x] `module_function` (makes methods both private instance methods and public singleton methods)
 - [x] Implicit self method calls (calling methods without explicit receiver resolves to `self.method`)

@@ -9952,6 +9952,240 @@ static int luby_base_defined(luby_state *L, int argc, const luby_value *argv, lu
     return (int)LUBY_E_OK;
 }
 
+// inspect - returns a string representation suitable for debugging
+static int luby_base_inspect(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (argc < 1) return (int)LUBY_E_TYPE;
+    luby_value v = argv[0];
+    char buf[256];
+    
+    switch (v.type) {
+        case LUBY_T_NIL:
+            if (out) *out = luby_string(L, "nil", 0);
+            return (int)LUBY_E_OK;
+        case LUBY_T_BOOL:
+            if (out) *out = luby_string(L, v.as.b ? "true" : "false", 0);
+            return (int)LUBY_E_OK;
+        case LUBY_T_INT:
+            snprintf(buf, sizeof(buf), "%lld", (long long)v.as.i);
+            if (out) *out = luby_string(L, buf, 0);
+            return (int)LUBY_E_OK;
+        case LUBY_T_FLOAT:
+            snprintf(buf, sizeof(buf), "%g", v.as.f);
+            if (out) *out = luby_string(L, buf, 0);
+            return (int)LUBY_E_OK;
+        case LUBY_T_STRING: {
+            // Strings are shown with quotes and escaped characters
+            const char *str = v.as.ptr ? (const char *)v.as.ptr : "";
+            size_t len = strlen(str);
+            size_t dest_len = len + 2;  // for quotes
+            // Count escape chars
+            for (size_t i = 0; i < len; i++) {
+                if (str[i] == '"' || str[i] == '\\' || str[i] == '\n' || str[i] == '\t' || str[i] == '\r')
+                    dest_len++;
+            }
+            int was_paused = L->gc_paused;
+            L->gc_paused = 1;
+            char *result = luby_gc_alloc_string(L, NULL, dest_len);
+            if (!result) { L->gc_paused = was_paused; return (int)LUBY_E_OOM; }
+            char *p = result;
+            *p++ = '"';
+            for (size_t i = 0; i < len; i++) {
+                if (str[i] == '"') { *p++ = '\\'; *p++ = '"'; }
+                else if (str[i] == '\\') { *p++ = '\\'; *p++ = '\\'; }
+                else if (str[i] == '\n') { *p++ = '\\'; *p++ = 'n'; }
+                else if (str[i] == '\t') { *p++ = '\\'; *p++ = 't'; }
+                else if (str[i] == '\r') { *p++ = '\\'; *p++ = 'r'; }
+                else *p++ = str[i];
+            }
+            *p++ = '"';
+            *p = '\0';
+            L->gc_paused = was_paused;
+            if (out) { out->type = LUBY_T_STRING; out->as.ptr = result; }
+            return (int)LUBY_E_OK;
+        }
+        case LUBY_T_SYMBOL: {
+            // Symbols are shown with colon prefix
+            const char *sym = v.as.ptr ? (const char *)v.as.ptr : "";
+            size_t len = strlen(sym);
+            int was_paused = L->gc_paused;
+            L->gc_paused = 1;
+            char *result = luby_gc_alloc_string(L, NULL, len + 1);  // +1 for colon
+            if (!result) { L->gc_paused = was_paused; return (int)LUBY_E_OOM; }
+            result[0] = ':';
+            memcpy(result + 1, sym, len);
+            result[len + 1] = '\0';
+            L->gc_paused = was_paused;
+            if (out) { out->type = LUBY_T_STRING; out->as.ptr = result; }
+            return (int)LUBY_E_OK;
+        }
+        case LUBY_T_ARRAY: {
+            luby_array *arr = (luby_array *)v.as.ptr;
+            snprintf(buf, sizeof(buf), "[Array: %zu items]", arr ? arr->count : 0);
+            if (out) *out = luby_string(L, buf, 0);
+            return (int)LUBY_E_OK;
+        }
+        case LUBY_T_HASH: {
+            luby_hash *h = (luby_hash *)v.as.ptr;
+            snprintf(buf, sizeof(buf), "{Hash: %zu items}", h ? h->count : 0);
+            if (out) *out = luby_string(L, buf, 0);
+            return (int)LUBY_E_OK;
+        }
+        case LUBY_T_CLASS: {
+            luby_class_obj *cls = (luby_class_obj *)v.as.ptr;
+            if (cls && cls->name) {
+                if (out) *out = luby_string(L, cls->name, 0);
+            } else {
+                if (out) *out = luby_string(L, "#<Class>", 0);
+            }
+            return (int)LUBY_E_OK;
+        }
+        case LUBY_T_MODULE: {
+            luby_class_obj *mod = (luby_class_obj *)v.as.ptr;
+            if (mod && mod->name) {
+                if (out) *out = luby_string(L, mod->name, 0);
+            } else {
+                if (out) *out = luby_string(L, "#<Module>", 0);
+            }
+            return (int)LUBY_E_OK;
+        }
+        case LUBY_T_OBJECT: {
+            luby_object *obj = (luby_object *)v.as.ptr;
+            if (obj && obj->klass && obj->klass->name) {
+                snprintf(buf, sizeof(buf), "#<%s:0x%016llx>", obj->klass->name, (unsigned long long)(uintptr_t)obj);
+            } else {
+                snprintf(buf, sizeof(buf), "#<Object:0x%016llx>", (unsigned long long)(uintptr_t)obj);
+            }
+            if (out) *out = luby_string(L, buf, 0);
+            return (int)LUBY_E_OK;
+        }
+        case LUBY_T_USERDATA: {
+            luby_userdata *ud = (luby_userdata *)v.as.ptr;
+            if (ud && !ud->alive) {
+                if (out) *out = luby_string(L, "#<dead>", 0);
+            } else if (ud && ud->klass && ud->klass->name) {
+                snprintf(buf, sizeof(buf), "#<%s:0x%016llx>", ud->klass->name, (unsigned long long)(uintptr_t)ud);
+                if (out) *out = luby_string(L, buf, 0);
+            } else {
+                snprintf(buf, sizeof(buf), "#<%s>", luby_type_name(v));
+                if (out) *out = luby_string(L, buf, 0);
+            }
+            return (int)LUBY_E_OK;
+        }
+        default:
+            snprintf(buf, sizeof(buf), "#<%s>", luby_type_name(v));
+            if (out) *out = luby_string(L, buf, 0);
+            return (int)LUBY_E_OK;
+    }
+}
+
+// object_id - returns a unique identifier for the object
+static int luby_base_object_id(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    (void)L;
+    if (argc < 1) return (int)LUBY_E_TYPE;
+    luby_value v = argv[0];
+    
+    // For immediate values (nil, bool, int), use a deterministic ID
+    switch (v.type) {
+        case LUBY_T_NIL:
+            if (out) *out = luby_int(4LL);  // Ruby convention: nil.object_id == 4
+            return (int)LUBY_E_OK;
+        case LUBY_T_BOOL:
+            // Ruby convention: true.object_id == 20, false.object_id == 0
+            if (out) *out = luby_int(v.as.b ? 20LL : 0LL);
+            return (int)LUBY_E_OK;
+        case LUBY_T_INT:
+            // Ruby convention: for integers, object_id = (int * 2) + 1
+            if (out) *out = luby_int((v.as.i * 2) + 1);
+            return (int)LUBY_E_OK;
+        case LUBY_T_SYMBOL:
+            // Symbols with same name should have same object_id (use pointer address)
+            if (out) *out = luby_int((int64_t)(uintptr_t)v.as.ptr);
+            return (int)LUBY_E_OK;
+        default:
+            // For heap-allocated objects, use pointer address
+            if (out) *out = luby_int((int64_t)(uintptr_t)v.as.ptr);
+            return (int)LUBY_E_OK;
+    }
+}
+
+// Class#name - returns the name of the class
+static int luby_class_name(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (argc < 1) return (int)LUBY_E_TYPE;
+    if (argv[0].type != LUBY_T_CLASS && argv[0].type != LUBY_T_MODULE) return (int)LUBY_E_TYPE;
+    
+    luby_class_obj *cls = (luby_class_obj *)argv[0].as.ptr;
+    if (cls && cls->name) {
+        if (out) *out = luby_string(L, cls->name, 0);
+    } else {
+        if (out) *out = luby_nil();
+    }
+    return (int)LUBY_E_OK;
+}
+
+// Class#superclass - returns the superclass
+static int luby_class_superclass(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    (void)L;
+    if (argc < 1) return (int)LUBY_E_TYPE;
+    if (argv[0].type != LUBY_T_CLASS) {
+        if (out) *out = luby_nil();
+        return (int)LUBY_E_OK;
+    }
+    
+    luby_class_obj *cls = (luby_class_obj *)argv[0].as.ptr;
+    if (cls && cls->super) {
+        if (out) { out->type = LUBY_T_CLASS; out->as.ptr = cls->super; }
+    } else {
+        if (out) *out = luby_nil();
+    }
+    return (int)LUBY_E_OK;
+}
+
+// Class#ancestors - returns array of ancestors (class + included modules + superclasses)
+static int luby_class_ancestors(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    if (argc < 1) return (int)LUBY_E_TYPE;
+    if (argv[0].type != LUBY_T_CLASS && argv[0].type != LUBY_T_MODULE) return (int)LUBY_E_TYPE;
+    
+    luby_class_obj *cls = (luby_class_obj *)argv[0].as.ptr;
+    if (!cls) {
+        if (out) *out = luby_array_new(L);
+        return (int)LUBY_E_OK;
+    }
+    
+    luby_value arr = luby_array_new(L);
+    
+    // Walk the inheritance chain
+    luby_class_obj *current = cls;
+    while (current) {
+        // Add the current class/module
+        luby_value cls_val;
+        cls_val.type = (current == cls && argv[0].type == LUBY_T_MODULE) ? LUBY_T_MODULE : LUBY_T_CLASS;
+        cls_val.as.ptr = current;
+        luby_array_push_value(L, arr, cls_val);
+        
+        // Add included modules (in reverse order of inclusion)
+        for (size_t i = 0; i < current->included_count; i++) {
+            luby_value mod_val;
+            mod_val.type = LUBY_T_MODULE;
+            mod_val.as.ptr = current->included_modules[i];
+            luby_array_push_value(L, arr, mod_val);
+        }
+        
+        // Move to superclass
+        current = current->super;
+    }
+    
+    if (out) *out = arr;
+    return (int)LUBY_E_OK;
+}
+
+// Symbol#to_sym - returns self (a symbol is already a symbol)
+static int luby_symbol_to_sym(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
+    (void)L;
+    if (argc < 1) return (int)LUBY_E_TYPE;
+    if (out) *out = argv[0];
+    return (int)LUBY_E_OK;
+}
+
 static int luby_base_freeze(luby_state *L, int argc, const luby_value *argv, luby_value *out) {
     (void)L;
     if (argc < 1) return (int)LUBY_E_TYPE;
@@ -12569,6 +12803,12 @@ LUBY_API void luby_open_base(luby_state *L) {
     luby_register_function(L, "kind_of?", luby_base_is_a);  // same as is_a?
     luby_register_function(L, "instance_of?", luby_base_instance_of);
     luby_register_function(L, "defined?", luby_base_defined);
+    luby_register_function(L, "inspect", luby_base_inspect);
+    luby_register_function(L, "object_id", luby_base_object_id);
+    luby_register_function(L, "name", luby_class_name);
+    luby_register_function(L, "superclass", luby_class_superclass);
+    luby_register_function(L, "ancestors", luby_class_ancestors);
+    luby_register_function(L, "to_sym", luby_symbol_to_sym);
     luby_register_function(L, "require", luby_base_require);
     luby_register_function(L, "load", luby_base_load);
     luby_register_function(L, "yield", luby_base_yield);
